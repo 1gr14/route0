@@ -14,12 +14,12 @@ const collapseDuplicateSlashes = (value: string): string => value.replace(/\/{2,
  * Strongly typed route descriptor and URL builder.
  *
  * A route definition uses:
+ *
  * - path params: `/users/:id`
  * - named search keys: `/users&tab&sort`
  * - loose search mode: trailing `&`, e.g. `/users&`
  *
- * Instances are callable (same as `.get()`), so `route(input)` and
- * `route.get(input)` are equivalent.
+ * Instances are callable (same as `.get()`), so `route(input)` and `route.get(input)` are equivalent.
  */
 export class Route0<TDefinition extends string, TSearchInput extends UnknownSearchInput = UnknownSearchInput> {
   readonly definition: TDefinition
@@ -1022,8 +1022,8 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
   /**
    * True when overlap is not resolvable by route ordering inside one route set.
    *
-   * Non-conflicting overlap means one route is a strict subset of another
-   * (e.g. `/x/y` is a strict subset of `/x/:id`) and can be safely ordered first.
+   * Non-conflicting overlap means one route is a strict subset of another (e.g. `/x/y` is a strict subset of `/x/:id`)
+   * and can be safely ordered first.
    */
   isConflict(other: AnyRoute | string | undefined): boolean {
     if (!other) return false
@@ -1070,8 +1070,8 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
 /**
  * Typed route collection with deterministic matching order.
  *
- * `Routes.create()` accepts either plain string definitions or route objects
- * and returns a "pretty" object with direct route access + helper methods under `._`.
+ * `Routes.create()` accepts either plain string definitions or route objects and returns a "pretty" object with direct
+ * route access + helper methods under `._`.
  */
 
 export class Routes<const T extends RoutesRecord = any> {
@@ -1160,8 +1160,7 @@ export class Routes<const T extends RoutesRecord = any> {
   /**
    * Matches an input URL against collection routes.
    *
-   * Returns first exact match according to precomputed ordering,
-   * otherwise returns `UnknownLocation`.
+   * Returns first exact match according to precomputed ordering, otherwise returns `UnknownLocation`.
    */
   _getLocation(href: `${string}://${string}`): UnknownLocation | ExactLocation
   _getLocation(hrefRel: `/${string}`): UnknownLocation | ExactLocation
@@ -1401,6 +1400,7 @@ export type _GeneralLocation = {
    * Path without search/hash (normalized for trailing slash).
    *
    * Example:
+   *
    * - input: `https://example.com/users/42?tab=posts#section`
    * - pathname: `/users/42`
    */
@@ -1409,6 +1409,7 @@ export type _GeneralLocation = {
    * Parsed query object.
    *
    * Example:
+   *
    * - `{ tab: "posts", sort: "desc" }`
    */
   search: UnknownSearchParsed
@@ -1416,6 +1417,7 @@ export type _GeneralLocation = {
    * Raw query string with leading `?`, if present, else empty string.
    *
    * Example:
+   *
    * - `?tab=posts&sort=desc`
    */
   searchString: string
@@ -1423,6 +1425,7 @@ export type _GeneralLocation = {
    * Raw hash with leading `#`, if present, else empty string.
    *
    * Example:
+   *
    * - `#section`
    */
   hash: string
@@ -1430,6 +1433,7 @@ export type _GeneralLocation = {
    * URL origin for absolute inputs.
    *
    * Example:
+   *
    * - href: `https://example.com/users/42`
    * - origin: `https://example.com`
    */
@@ -1438,6 +1442,7 @@ export type _GeneralLocation = {
    * Full absolute href for absolute inputs.
    *
    * Example:
+   *
    * - `https://example.com/users/42?tab=posts#section`
    */
   href: string | undefined
@@ -1445,6 +1450,7 @@ export type _GeneralLocation = {
    * Relative href (`pathname + search + hash`).
    *
    * Example:
+   *
    * - pathname: `/users/42`
    * - search: `?tab=posts`
    * - hash: `#section`
@@ -1455,6 +1461,7 @@ export type _GeneralLocation = {
    * Whether input was absolute URL.
    *
    * Examples:
+   *
    * - `https://example.com/users/42` -> `true`
    * - `/users/42` -> `false`
    */
