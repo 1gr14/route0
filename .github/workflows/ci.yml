@@ -81,6 +81,9 @@ jobs:
           name: build-files
           path: .
 
+      - name: Install runtime peer deps
+        run: npm install --no-save @devp0nt/flat0
+
       - name: Smoke test built package
         run: node scripts/smoke.mjs
 
