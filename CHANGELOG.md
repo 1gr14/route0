@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/devp0nt/route0/compare/v1.0.2...v1.1.0) (2026-05-29)
+
+
+### Features
+
+* add { origin, encode } options to get() and a route.abs() helper ([7c841f3](https://github.com/devp0nt/route0/commit/7c841f39c46f0c0661f31663e8db0dd0e7eaaf46))
+
 ## [1.0.2](https://github.com/devp0nt/route0/compare/v1.0.1...v1.0.2) (2026-05-29)
 
 
