@@ -1,3 +1,10 @@
+## [1.1.1](https://github.com/devp0nt/route0/compare/v1.1.0...v1.1.1) (2026-05-30)
+
+
+### Bug Fixes
+
+* document the Infer type accessor and cover it with type tests ([12e6dd6](https://github.com/devp0nt/route0/commit/12e6dd6f92b8b49243bb804b3200daaae096631a))
+
 # [1.1.0](https://github.com/devp0nt/route0/compare/v1.0.2...v1.1.0) (2026-05-29)
 
 
