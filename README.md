@@ -51,12 +51,13 @@ routes.user({ id: 42 }) // '/users/42'
 ## Install
 
 ```sh
-bun add @devp0nt/route0
+bun add @devp0nt/route0 @devp0nt/flat0
 # or: npm install / pnpm add / yarn add
 ```
 
-Bun 1+ or Node.js 20+. ESM only. `@devp0nt/flat0` is a peer dependency (used for
-search-string encoding); `@standard-schema/spec` is optional.
+Bun 1+ or Node.js 20+. ESM only. `@devp0nt/flat0` is a required peer dependency
+(used for search-string encoding) — install it alongside route0, since pnpm and
+yarn don't auto-install peers. `@standard-schema/spec` is an optional peer.
 
 ## Build a path
 
