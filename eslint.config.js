@@ -8,16 +8,10 @@ export default defineConfig([
   {
     ignores: [
       '**/node_modules/**',
-      '**/engine/tests/template/**',
       '**/dist/**',
-      '**/temp/**',
-      '**/dist-test/**',
       '**/dist-npm/**',
-      '**/packages-dist-npm/**',
-      '**/.cache/**',
       '**/.husky/**',
       '**/.git/**',
-      '**/templates/**',
       'tsdown.config.ts',
       'eslint.config.js',
       '.commitlintrc.js',
