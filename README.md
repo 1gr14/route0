@@ -1,7 +1,9 @@
 # @1gr14/route0
 
-> A strongly-typed URL router for TypeScript — define a route once, then build
-> paths and parse URLs with full type inference.
+> Type-safe URL paths for TypeScript. Write a pattern like `/users/:id` once and
+> get a fully-typed path builder and URL parser out of it — params inferred from
+> the string. Not a router: the typed path toolkit you build your own router on,
+> or wire into the one you already use.
 
 [![CI](https://github.com/1gr14/route0/actions/workflows/ci.yml/badge.svg)](https://github.com/1gr14/route0/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/@1gr14/route0.svg)](https://www.npmjs.com/package/@1gr14/route0)
@@ -11,42 +13,47 @@
 
 <!-- docs:start -->
 
-You write a URL pattern like `/users/:id` once. `route0` gives you both
-directions from it: build a path from typed params, and parse a real URL back
-into typed params. Params are inferred from the pattern string — no manual
-types. It also handles search query strings (including nested objects), optional
-segments, wildcards, route collections, and param validation via
-[Standard Schema](https://standardschema.dev).
+route0 turns a URL pattern into a set of fully-typed helpers. You write the
+pattern — `/idea/:id` — **once**, and from that single string you get a typed
+path builder, a URL parser, search-param handling, a
+[Standard Schema](https://standardschema.dev) validator, and the matching
+primitives you'd build a router from. Params are inferred from the pattern; you
+never hand-write their types.
+
+## Why
+
+Most apps — whatever the framework — need to declare paths, for pages or for API
+endpoints. The crude way is to scatter string literals:
+`<Route path="/idea/:id" />` in one place, `<Link to="/idea/123" />` in another.
+Rename the path and you're hand-fixing every call site, with no type checker to
+catch the one you missed.
+
+A tidier attempt is a `routes.ts` full of functions like
+`const ideaView = (id: string) => '/idea/' + id`. Better — but you still declare
+every argument by hand, and the moment you want search params, a hash, or an
+absolute URL, you're back to gluing strings together.
+
+route0 derives all of that from the pattern itself:
 
 ```ts
-import { Route0, Routes } from '@1gr14/route0'
+import { Route0 } from '@1gr14/route0'
 
-const userRoute = Route0.create('/users/:id')
+const ideaView = Route0.create('/idea/:id')
 
-// build a path — call the route directly, or use .get(); params are typed
-userRoute({ id: 42 }) // '/users/42'
-userRoute.get({ id: 42 }) // same thing
-
-// search params (nested objects + arrays) and a hash are always available
-userRoute({
-  id: 42,
-  '?': { tab: 'reviews', sort: ['recent', 'top'] },
-  '#': 'top',
-})
-// '/users/42?tab=reviews&sort[]=recent&sort[]=top#top'  (brackets URL-encoded)
-
-// parse a real URL back into typed params
-const rel = userRoute.getRelation('/users/42')
-rel.type // 'exact'
-rel.params // { id: '42' }
-
-// or define a whole collection at once
-const routes = Routes.create({
-  home: '/',
-  user: '/users/:id',
-})
-routes.user({ id: 42 }) // '/users/42'
+ideaView({ id: 123 }) // '/idea/123'
+ideaView.abs({ id: 123 }) // 'https://example.com/idea/123'
+ideaView({ id: 123, '?': { ref: 'feed' } }) // '/idea/123?ref=feed'
+ideaView({ id: 123, '#': 'comments' }) // '/idea/123#comments'
+ideaView.definition // '/idea/:id'
 ```
+
+## Not a router
+
+route0 doesn't match requests or render pages — it's the typed-path layer that
+sits _under_ a router. Bring your own, plug it into an existing one, or use
+[Point0](https://1gr14.dev/point0), which has route0 built in. The matching
+primitives further down (`getRelation`, the `is*` checks, specificity ordering)
+are exactly what you need to wire one up.
 
 ## Install
 
@@ -61,19 +68,23 @@ yarn don't auto-install peers. `@standard-schema/spec` is an optional peer.
 
 ## Build a path
 
-`Route0.create(pattern)` returns a route. Call it directly, or use `.get()` —
-they do the same thing. Params from the pattern are required and typed:
+`Route0.create(pattern)` returns a route. The route is **callable** — call it
+directly, or use `.get()`; they do the same thing. Params named in the pattern
+(`:org`, `:id`) are required, typed, and accept a `string` or a `number`:
 
 ```ts
 const route = Route0.create('/org/:org/users/:id')
 
-route.get({ org: 'acme', id: '42' }) // '/org/acme/users/42'
-route({ org: 'acme', id: '42' }) // same thing — the route is callable
+route({ org: 'acme', id: 42 }) // '/org/acme/users/42'  — callable form
+route.get({ org: 'acme', id: 42 }) // same thing
+route.definition // '/org/:org/users/:id'  — the pattern back out
+route.params // { org: true, id: true }  — param name → required?
 ```
 
-## Params: optional and wildcard
+## Optional and wildcard params
 
-Mark a param optional with `?`, or capture the rest with `*`:
+Mark a param optional with a trailing `?`, or capture the rest of the path with
+`*`:
 
 ```ts
 const post = Route0.create('/users/:id/posts/:slug?')
@@ -81,13 +92,18 @@ post.get({ id: '1', slug: 'hello' }) // '/users/1/posts/hello'
 post.get({ id: '1' }) // '/users/1/posts'  — optional param dropped
 
 const files = Route0.create('/files/*')
-files.getRelation('/files/a/b/c.txt').params // { '*': '/a/b/c.txt' }
+files.get({ '*': 'a/b/c.txt' }) // '/files/a/b/c.txt'
+files.getRelation('/files/a/b/c.txt').params // { '*': 'a/b/c.txt' }
 ```
+
+A wildcard always lives under the `'*'` key. It may be a whole segment (`/*`) or
+inline within one (`/files/x*`); only one wildcard is allowed, and it must come
+last.
 
 ## Search params and hash
 
 Pass search params under the `?` key and a fragment under `#`. Arrays and deeply
-nested objects are encoded for you:
+nested objects are encoded for you (this is what the `@1gr14/flat` peer is for):
 
 ```ts
 const search = Route0.create('/search')
@@ -100,27 +116,30 @@ search.get({
   },
 })
 // '/search?q=shoes&tags[]=sale&tags[]=new&filters[price][min]=10&filters[price][max]=50'
-// (brackets are URL-encoded in the returned string)
+// (the brackets are percent-encoded in the returned string)
 
-userRoute.get({ id: 9, '#': 'reviews' }) // '/users/9#reviews'
+ideaView.get({ id: 9, '#': 'reviews' }) // '/idea/9#reviews'
 ```
 
 ## Absolute URLs
 
-Pass an `origin` in the options object — `true` uses `window.location.origin`
-(or the route's configured origin), or hand it an explicit string:
+Pass an `origin` in the options object — `true` uses the route's configured
+origin (or `window.location.origin` in the browser), or hand it an explicit
+string:
 
 ```ts
-userRoute.get({ id: '1' }, { origin: true }) // 'https://example.com/users/1'
-userRoute.get({ id: '1' }, { origin: 'https://cdn.example.com' }) // 'https://cdn.example.com/users/1'
+const ideaView = Route0.create('/idea/:id', { origin: 'https://1gr14.dev' })
+
+ideaView.get({ id: 1 }, { origin: true }) // 'https://1gr14.dev/idea/1'
+ideaView.get({ id: 1 }, { origin: 'https://cdn.1gr14.dev' }) // 'https://cdn.1gr14.dev/idea/1'
 ```
 
 `route.abs()` is the same as `get()` but defaults `origin` to `true`, so it's
 the shorthand when you always want an absolute URL:
 
 ```ts
-userRoute.abs({ id: '1' }) // 'https://example.com/users/1'
-userRoute.abs({ id: '1' }, { origin: false }) // '/users/1'  — opt back out
+ideaView.abs({ id: 1 }) // 'https://1gr14.dev/idea/1'
+ideaView.abs({ id: 1 }, { origin: false }) // '/idea/1'  — opt back out
 ```
 
 ## Pretty, unencoded paths
@@ -135,67 +154,54 @@ file.get({ name: 'a b', '?': { q: 'x y' } }) // '/files/a%20b?q=x%20y'
 file.get({ name: 'a b', '?': { q: 'x y' } }, { encode: false }) // '/files/a b?q=x y'
 ```
 
-## Parse a URL
+## Extend a route
 
-`getRelation()` matches a URL against the route and tells you how they relate —
-`exact`, `ancestor`, `descendant`, or `unmatched` — with typed params:
+Need a shared prefix for a whole section? `route.extend(suffix)` appends to an
+existing route and returns a new one — types and all — so you declare the base
+once and grow from it:
 
 ```ts
-const route = Route0.create('/users/:id')
+const ideaBase = Route0.create('/idea')
+const ideaView = ideaBase.extend('/:id')
+const ideaEdit = ideaView.extend('/edit')
 
-route.getRelation('/users/42') // { type: 'exact', params: { id: '42' }, ... }
-route.getRelation('/users') // { type: 'ancestor', ... }
-route.getRelation('/users/42/posts') // { type: 'descendant', ... }
-route.getRelation('/about') // { type: 'unmatched', ... }
+ideaView.definition // '/idea/:id'
+ideaView({ id: '123' }) // '/idea/123'
+
+ideaEdit.definition // '/idea/:id/edit'
+ideaEdit({ id: '123' }) // '/idea/123/edit'
 ```
 
-This is what powers "is this link active?" and breadcrumb logic without string
-juggling.
+## Typed search params
 
-## A collection of routes
-
-Group routes with `Routes.create()`, then match any pathname against the whole
-set at once. Each route stays individually typed and callable:
+Search params are untyped by default. Call `.search<…>()` to lock in a shape —
+it's a type-only refinement (no runtime cost) that flows into `get()` and into
+the `Infer` types below:
 
 ```ts
-const routes = Routes.create({
-  home: '/',
-  users: '/users',
-  userDetail: Route0.create('/users/:id'),
-})
+const list = Route0.create('/idea').search<{
+  page?: number
+  sort?: 'new' | 'top'
+}>()
 
-routes.userDetail.get({ id: '3' }) // '/users/3'
-
-// match a pathname against the collection
-const loc = routes._.getLocation('/users/123')
-loc.route // '/users/:id'  — the pattern that matched
-loc.params // { id: '123' }
-loc.pathname // '/users/123'
+list.get({ '?': { page: 2, sort: 'top' } }) // '/idea?page=2&sort=top'
+list.get({ '?': { sort: 'nope' } }) // ✗ type error — 'nope' is not assignable
 ```
 
 ## Validate params with Standard Schema
 
 Every route exposes a `.schema` that implements
 [Standard Schema](https://standardschema.dev), so it parses and validates params
-(and coerces them to strings) like any other schema:
+(and coerces them to strings) and drops into any pipeline that speaks the spec:
 
 ```ts
 const route = Route0.create('/x/:id/:slug?')
 
-route.schema.safeParse({ id: '1' }) // { success: true, data: { id: '1', slug: undefined } }
-route.schema.safeParse({ slug: 'x' }) // { success: false, error: ... } — `id` is required
-route.schema.parse({ id: 1 }) // { id: '1' } — throws on invalid input
-```
-
-## Extend a route
-
-Build longer routes from a shared base:
-
-```ts
-const admin = Route0.create('/admin')
-const adminUser = admin.extend('/users/:id')
-
-adminUser.get({ id: '5' }) // '/admin/users/5'
+route.schema.safeParse({ id: 1 })
+// { success: true, data: { id: '1', slug: undefined }, error: undefined } — number coerced
+route.schema.safeParse({ slug: 'x' })
+// { success: false, data: undefined, error: Error } — 'id' is required
+route.schema.parse({ id: '1' }) // { id: '1', slug: undefined } — throws on invalid input
 ```
 
 ## Infer types from a route
@@ -227,42 +233,176 @@ read it through `typeof`. The members:
 | `ParamsOutput`          | Parsed params — required `string`, optional `string \| undefined`.      |
 | `SearchInput`           | The route's typed search params (set via `.search<…>()`).               |
 
-## API reference
+## Parse any URL
 
-### `Route0`
+`Route0.getLocation(url)` is the inverse of building — it takes any href, path,
+`URL`, or location-like object and returns a structured, route-agnostic location
+(the search string is parsed with the same nested-aware rules used to build it):
 
-| Call                              | Result                                              |
-| --------------------------------- | --------------------------------------------------- |
-| `Route0.create(pattern, config?)` | Create a route from a pattern (or clone a route).   |
-| `Route0.from(definition)`         | Normalize a definition into a callable route.       |
-| `Route0.getLocation(url)`         | Parse any URL/href/location into a location object. |
+```ts
+const loc = Route0.getLocation('/search?q=shoes&tag[]=a&tag[]=b#results')
 
-### Route instance
+loc.pathname // '/search'
+loc.search // { q: 'shoes', tag: ['a', 'b'] }  — parsed, nested-aware
+loc.searchString // '?q=shoes&tag[]=a&tag[]=b'
+loc.hash // '#results'
+loc.hrefRel // '/search?q=shoes&tag[]=a&tag[]=b#results'  — pathname + search + hash
+loc.abs // false  — input was relative
+loc.route // undefined  — no route was matched against
+loc.params // undefined
+```
 
-| Call                          | Result                                                    |
-| ----------------------------- | --------------------------------------------------------- |
-| `route(input?, options?)`     | Build a path (callable form).                             |
-| `route.get(input?, options?)` | Build a path (same as calling it).                        |
-| `route.abs(input?, options?)` | Build a path, `origin` defaulting to `true`.              |
-| `route.getRelation(url)`      | Match a URL → `{ type, params, ... }`.                    |
-| `route.getParamsKeys()`       | The param names in the pattern.                           |
-| `route.getTokens()`           | The parsed pattern structure.                             |
-| `route.extend(suffix)`        | A new route with the suffix appended.                     |
-| `route.schema`                | A Standard Schema for the params (`parse` / `safeParse`). |
-| `route.definition`            | The pattern string.                                       |
-| `typeof route.Infer.*`        | Type-only inference (`ParamsInput`, `ParamsOutput`, …).   |
+For an absolute input you also get `origin`, `href`, `host`, `hostname`, and
+`port` filled in (otherwise they're `undefined`).
 
-**Options** (`get` / `abs` second argument): `origin` (`boolean | string` —
-`true` uses the configured origin, a string overrides it; defaults to `true` for
-`abs`) and `encode` (default `true`; `false` emits a human-readable, unencoded
-path and search string).
+## Match a URL against a route
 
-### `Routes`
+`getRelation(url)` matches a URL against the route and tells you how **the route
+relates to that URL**, with typed params pulled out:
 
-| Call                        | Result                                              |
-| --------------------------- | --------------------------------------------------- |
-| `Routes.create(record)`     | A typed collection; each value is a callable route. |
-| `routes._.getLocation(url)` | Match a URL against the whole collection.           |
+- `exact` — the URL _is_ this route.
+- `ancestor` — the route is an ancestor of the URL (the URL is a deeper
+  sub-path).
+- `descendant` — the route is a descendant of the URL (the URL is a shallower
+  prefix).
+- `unmatched` — unrelated.
+
+```ts
+const route = Route0.create('/users/:id')
+
+route.getRelation('/users/42')
+// { type: 'exact', params: { id: '42' }, exact: true, ancestor: false, descendant: false, unmatched: false, route: '/users/:id' }
+route.getRelation('/users/42/posts') // { type: 'ancestor',   params: { id: '42' }, ... }
+route.getRelation('/users') // { type: 'descendant', params: {},          ... }
+route.getRelation('/about') // { type: 'unmatched',  params: {},          ... }
+```
+
+When you only need a yes/no and not the params, the `is*` checks skip building
+the relation object — cheaper on hot paths like rendering nav links:
+
+```ts
+route.isExact('/users/42') // true
+route.isExactOrAncestor('/users/42/posts') // true  — "is this nav link active?"
+route.isAncestor('/users/42/posts') // true
+route.isDescendant('/users') // true
+```
+
+## A collection of routes
+
+Keeping every route in its own variable gets noisy. `Routes.create()` gathers
+them into one typed object — pass plain pattern strings, route instances, or a
+mix. Each route stays individually typed and callable, reachable by its key:
+
+```ts
+import { Route0, Routes } from '@1gr14/route0'
+
+const routes = Routes.create({
+  ideaNew: '/idea/new',
+  ideaView: Route0.create('/idea/:id'),
+  ideaEdit: '/idea/:id/edit',
+})
+
+routes.ideaView({ id: '123' }) // '/idea/123'
+routes.ideaEdit({ id: '123' }) // '/idea/123/edit'
+```
+
+Everything under `._` is the collection's own toolbox, kept on a separate key so
+it never collides with your route names.
+
+## Match against the whole collection
+
+`routes._.getLocation(url)` matches a URL against every route at once and
+returns the location of the first (most specific) **exact** match — enriched
+with the matched `route` and its typed `params`:
+
+```ts
+const loc = routes._.getLocation('https://example.com/idea/123/edit?ref=feed')
+
+loc.route // '/idea/:id/edit'  — the pattern that matched
+loc.params // { id: '123' }
+loc.search // { ref: 'feed' }
+loc.pathname // '/idea/123/edit'
+loc.hrefRel // '/idea/123/edit?ref=feed'
+loc.href // 'https://example.com/idea/123/edit?ref=feed'
+loc.abs // true
+
+routes._.getLocation('/nope').route // undefined  — nothing matched
+```
+
+## Deterministic match order
+
+A collection sorts its routes once, from most specific to least, and exposes
+that order. This is what lets `/idea/new` and `/idea/:id` coexist: the static
+route is tried first, so it wins the URL `/idea/new` instead of being swallowed
+by the param route.
+
+```ts
+routes._.pathsOrdering // ['/idea/new', '/idea/:id', '/idea/:id/edit']  — patterns, specific first
+routes._.keysOrdering // ['ideaNew', 'ideaView', 'ideaEdit']           — same order, by key
+routes._.ordered[0].definition // '/idea/new'                          — same order, as route objects
+```
+
+The order is total and deterministic (independent of insertion order), so you
+can feed `_.ordered` straight into a real router and trust that more specific
+patterns always come first.
+
+## Share a base origin
+
+`routes._.clone(config)` returns a new collection with the config applied to
+every route — the usual case is stamping an `origin` on the whole set so
+`.abs()` works everywhere:
+
+```ts
+const absRoutes = routes._.clone({ origin: 'https://1gr14.dev' })
+absRoutes.ideaView.abs({ id: 123 }) // 'https://1gr14.dev/idea/123'
+```
+
+A single route has the same `route.clone(config)`.
+
+## Compare and order patterns yourself
+
+When you're wiring up your own router, you sometimes need to reason about two
+patterns directly. These comparators answer that:
+
+```ts
+const view = Route0.create('/idea/:id')
+const fresh = Route0.create('/idea/new')
+
+fresh.isMoreSpecificThan(view) // true  — a static segment beats a param
+view.isOverlap(fresh) // true  — both can match '/idea/new'
+view.isConflict(fresh) // false — ordering resolves it (try the static one first)
+
+Route0.create('/idea/:id').isConflict('/idea/:slug')
+// true — same shape, equally specific: no ordering can tell them apart
+```
+
+`isOverlap` asks whether two patterns can ever match the same URL; `isConflict`
+narrows that to overlaps that ordering _can't_ resolve (genuine ambiguity you
+have to fix); `isMoreSpecificThan` is the total order the collection sorts by.
+
+## Lower-level building blocks
+
+The pieces a router generator tends to reach for:
+
+```ts
+// Inspect a pattern's structure
+Route0.create('/users/:id/posts/:slug?').getTokens()
+// [
+//   { kind: 'static', value: 'users' },
+//   { kind: 'param', name: 'id', optional: false },
+//   { kind: 'static', value: 'posts' },
+//   { kind: 'param', name: 'slug', optional: true },
+// ]
+Route0.create('/org/:org/users/:id').getParamsKeys() // ['org', 'id']
+
+// Normalize "route or string" inputs — returns the same instance if already a route
+Route0.from('/users/:id') // a callable route
+Route0.from(existingRoute) // the same instance, untouched
+
+// One combined regex that matches any route in a set
+const re = Route0.getRegexGroup([routes.ideaNew, routes.ideaView])
+re.test('/idea/new') // true
+```
 
 ## Requirements
 
@@ -277,7 +417,7 @@ path and search string).
 Questions, bugs, or want to hang with other builders? Join the 1gr14 community —
 one hub for all our open-source projects, this one included. Get help, share
 what you built, or just say hi:
-[1gr14.dev/community](https://1gr14.dev/community)
+[1gr14.dev/#community](https://1gr14.dev/#community)
 
 ## Contributing
 
@@ -292,8 +432,5 @@ Issues and PRs welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) and the
 
 ---
 
-```text
-Building open-source software for the glory of the Lord Jesus Christ ☦️
-With love for developers of all backgrounds around the world ❤️
-Sergei Dmitriev, 2026 😎
-```
+Made by [1gr14](https://1gr14.dev), driven by
+[community](https://1gr14.dev/#community)
