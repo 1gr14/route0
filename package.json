@@ -1,6 +1,6 @@
 {
   "name": "@1gr14/route0",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Type-safe URL paths for TypeScript — define a pattern once, then build paths and parse URLs with full type inference, search params, and Standard Schema validation. Not a router; the typed path toolkit you build one on.",
   "keywords": [
     "router",
