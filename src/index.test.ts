@@ -851,6 +851,14 @@ describe('Route0', () => {
     testFn(routeWithParams) // This should also work
   })
 
+  it('CallableRoute distributes over a definitions union', () => {
+    // A union definition must produce a union of per-route callables, NOT (Route0<A> | Route0<B>) & (getA | getB):
+    // that intersection normalizes as a cross-product — N routes → N² union members — and a routes map with a few
+    // hundred entries indexed by a generic key (e.g. a typed navigate(name, input)) trips TS2590.
+    expectTypeOf<CallableRoute<'/a' | '/b/:id'>>().toEqualTypeOf<CallableRoute<'/a'> | CallableRoute<'/b/:id'>>()
+    expectTypeOf<CallableRoute<'/a'>>().toEqualTypeOf<AnyRoute<'/a'> & AnyRoute<'/a'>['get']>()
+  })
+
   it('clone, from, create', () => {
     const route = Route0.create('/path')
     const clonedRoute = route.clone()
@@ -2674,6 +2682,87 @@ describe('ordering', () => {
     const { pathsOrdering: ordering } = Routes._.makeOrdering(routes)
     expect(ordering).toEqual([])
   })
+
+  it('_makeOrdering: duplicate definitions under different keys keep both keys in insertion order', () => {
+    const routes = Routes.create({ one: '/same/:id', two: '/same/:id' })
+    expect(routes._.keysOrdering).toEqual(['one', 'two'])
+    expect(routes._.pathsOrdering).toEqual(['/same/:id', '/same/:id'])
+  })
+
+  it('ordered routes agree with keysOrdering and pathsOrdering', () => {
+    const routes = Routes.create({
+      detail: '/users/:id',
+      list: '/users',
+      any: '/users/*?',
+    })
+    expect(routes._.ordered.map((route) => route.definition)).toEqual(routes._.pathsOrdering)
+    const byKey: Record<string, CallableRoute> = routes._.routes
+    expect(routes._.keysOrdering.map((key) => byKey[key].definition)).toEqual(routes._.pathsOrdering)
+  })
+
+  it('isMoreSpecificThan is a strict total order (antisymmetric, transitive) over a diverse route set', () => {
+    // `Array.sort` only produces a correct order from a consistent comparator. The specificity comparator once mixed
+    // two orders (specificity for overlaps, depth otherwise) and was non-transitive, letting sort mis-order
+    // overlapping routes. This property check over every pair/triple guards against reintroducing that.
+    const defs = [
+      '/',
+      '/:slug',
+      '/:slug?',
+      '/*',
+      '/*?',
+      '/a',
+      '/a/:id',
+      '/a/:id?',
+      '/a/*',
+      '/a/*?',
+      '/a/b',
+      '/a/b/:c',
+      '/a/:x/c',
+      '/x*',
+      '/a/b/c/d',
+      '/:x/:y',
+    ]
+    const instances = defs.map((definition) => Route0.create(definition))
+    for (const a of instances) {
+      expect(a.isMoreSpecificThan(a)).toBe(false) // irreflexive
+      for (const b of instances) {
+        if (a.definition !== b.definition) {
+          // total + antisymmetric: exactly one direction holds
+          expect(a.isMoreSpecificThan(b)).not.toBe(b.isMoreSpecificThan(a))
+        }
+        for (const c of instances) {
+          if (a.isMoreSpecificThan(b) && b.isMoreSpecificThan(c)) {
+            expect(a.isMoreSpecificThan(c)).toBe(true) // transitive
+          }
+        }
+      }
+    }
+  })
+
+  it('_makeOrdering result is pairwise-consistent with isMoreSpecificThan', () => {
+    const routes = {
+      root: '/',
+      slug: '/:slug',
+      any: '/*',
+      a: '/a',
+      aId: '/a/:id',
+      aOpt: '/a/:id?',
+      aStar: '/a/*',
+      aStarOpt: '/a/*?',
+      ab: '/a/b',
+      abC: '/a/b/:c',
+      aXc: '/a/:x/c',
+      inline: '/x*',
+    }
+    const { keysOrdering } = Routes._.makeOrdering(routes)
+    const hydrated: Record<string, CallableRoute> = Routes._.hydrate(routes)
+    for (let i = 0; i < keysOrdering.length; i++) {
+      for (let j = i + 1; j < keysOrdering.length; j++) {
+        // nothing later in the ordering may be strictly more specific than anything before it
+        expect(hydrated[keysOrdering[j]].isMoreSpecificThan(hydrated[keysOrdering[i]])).toBe(false)
+      }
+    }
+  })
 })
 
 describe('ordering: matching is correct and insertion-order independent', () => {
@@ -2851,6 +2940,46 @@ describe('ordering: matching is correct and insertion-order independent', () => 
         ['/deep/nested/unknown', '/*'],
       ],
     )
+  })
+
+  it('required param beats optional param for the same URL', () => {
+    expectStableMatching({ required: '/u/:id', optional: '/u/:id?' }, [
+      ['/u/42', '/u/:id'],
+      ['/u', '/u/:id?'],
+    ])
+  })
+
+  it('required wildcard beats optional wildcard for the same URL', () => {
+    expectStableMatching({ required: '/a/*', optional: '/a/*?' }, [
+      ['/a/x', '/a/*'],
+      ['/a/x/y', '/a/*'],
+    ])
+  })
+
+  it('param beats an inline-wildcard segment at the same slot (segment ranks: static > param > wildcard)', () => {
+    // '/files*' is narrower than '/:page' textually, but a wildcard segment ranks below a param — matching one URL
+    // segment exactly is treated as more specific than swallowing arbitrarily many. This pins the convention.
+    expectStableMatching({ files: '/files*', page: '/:page' }, [
+      ['/files-archive', '/:page'],
+      ['/files/a/b', '/files*'],
+      ['/about', '/:page'],
+    ])
+  })
+
+  it('root with optional param and optional wildcard siblings', () => {
+    expectStableMatching({ root: '/', slug: '/:slug?', rest: '/*?' }, [
+      ['/', '/'],
+      ['/x', '/:slug?'],
+      ['/x/y', '/*?'],
+    ])
+  })
+
+  it('optional param beats optional wildcard when both match the bare base', () => {
+    expectStableMatching({ opt: '/docs/:page?', rest: '/docs/*?' }, [
+      ['/docs', '/docs/:page?'],
+      ['/docs/guide', '/docs/:page?'],
+      ['/docs/a/b', '/docs/*?'],
+    ])
   })
 })
 
