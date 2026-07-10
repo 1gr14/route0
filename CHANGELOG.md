@@ -5,6 +5,8 @@ work; `bun run release` promotes that section to the new version.
 
 ## Unreleased
 
+## 0.1.3 — 2026-07-10
+
 - Fix: `CallableRoute` now distributes over union definitions. Previously
   `CallableRoute<union>` normalized as an intersection of two unions — an N²
   cross-product that tripped TS2590 ("union type too complex") once a routes
