@@ -1254,11 +1254,17 @@ export type AnyRoute<
   T extends Route0<string> | string = string,
   TSearch extends UnknownSearchInput = UnknownSearchInput,
 > = T extends string ? Route0<T, TSearch> : T
-/** Callable route (`route(input)`) plus route instance methods/properties. */
+/**
+ * Callable route (`route(input)`) plus route instance methods/properties.
+ *
+ * Distributes over `T` so that `CallableRoute<'/a' | '/b'>` is a union of per-route intersections, not an intersection
+ * of two unions — the latter normalizes as a cross-product (N routes → N² union members) and trips TS2590 ("union type
+ * too complex") around ~316 routes when a routes map is indexed by a generic key.
+ */
 export type CallableRoute<
   T extends Route0<string> | string = string,
   TSearch extends UnknownSearchInput = UnknownSearchInput,
-> = AnyRoute<T, TSearch> & AnyRoute<T, TSearch>['get']
+> = T extends unknown ? AnyRoute<T, TSearch> & AnyRoute<T, TSearch>['get'] : never
 /** Route input accepted by most APIs: definition string or route object/callable. */
 export type AnyRouteOrDefinition<T extends string = string> = AnyRoute<T> | CallableRoute<T> | T
 /** Route-level runtime configuration. */
