@@ -5,6 +5,8 @@ work; `bun run release` promotes that section to the new version.
 
 ## Unreleased
 
+## 0.2.0 — 2026-07-20
+
 - Feature: params can be restricted to a set of values — `:name(a|b)` and
   `:name(a|b)?`. The set is enforced everywhere at once: matching, building,
   `.schema` validation, the emitted JSON Schema (a real `enum`), specificity and
