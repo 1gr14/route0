@@ -5,6 +5,50 @@ work; `bun run release` promotes that section to the new version.
 
 ## Unreleased
 
+- Feature: params can be restricted to a set of values — `:name(a|b)` and
+  `:name(a|b)?`. The set is enforced everywhere at once: matching, building,
+  `.schema` validation, the emitted JSON Schema (a real `enum`), specificity and
+  conflict detection. At the type level the param narrows from `string` to the
+  literal union, in both directions — `get()` rejects an unlisted value, and
+  parsed params come back as the union. A value is built from URL-unreserved
+  characters only, so its encoded and decoded forms are identical; at most 32
+  values per param, a cap that keeps TypeScript from failing with an
+  "excessively deep" error instead of a readable one.
+- Fix: a route whose extra segment names a finite set of values now takes the
+  shared URL from its own prefix. `_compareSpecificity` ranked a segment the
+  shorter route simply does not have as infinitely specific, so `/:locale?`
+  sorted ahead of `/:locale?/author` and swallowed `/author` as
+  `locale='author'` — along with every other single-segment top-level route. An
+  absent segment now ranks above a wildcard, an optional param and a plain
+  required param, but below a constrained param and a static segment. So
+  `/:locale?/author` and `/:l?/:kind(new|top)` reclaim `/author` and `/new`,
+  while a generic `/x/:p?/:q` still does not steal `/x/v` from `/x/:p?`. This
+  fix is independent of constraints and applies to plain optional params too.
+- Fix: a malformed `:`-segment throws at creation instead of silently degrading
+  into a literal static segment that matches nothing. `:locale(ru|en)?` used to
+  become a static literal, and the descendant matcher minted a phantom param
+  named `locale(ru|en)`. `:prefix*` stays a legal prefixed wildcard.
+- Fix: `:id*` now types as a wildcard under the `'*'` key, matching what the
+  runtime has always done. The type-level segment reader tried `:${Name}` before
+  the wildcard branches and typed it as a param called `id*`, which made
+  `get({ '*': … })` a compile error on a route that works.
+- Fix: `isOverlap` is now exact. It used to enumerate candidate paths, probing
+  every param with invented values (`x`, `y`) and capping the candidate set at
+  512, so it missed any overlap whose witness URL needs a param to take a value
+  from the other route's own vocabulary — `/:a/x` and `/x/:b` both match `/x/x`,
+  and were reported as not overlapping. It now walks both token sequences
+  directly. Checked against brute-force ground truth over 20k random route
+  pairs: the walk matches it on every pair, where the old enumeration was wrong
+  on roughly one pair in eight — always a false negative.
+- Fix: a duplicate param name (`/:a/:a`) now throws at creation. Previously the
+  second occurrence silently overwrote the first in the params map, so one of
+  the two segments could never be filled independently.
+- Added: `route.getParamsValues()` (allowed values per constrained param),
+  `Infer.ParamsValues`, and the standalone `ParamsValues` / `ParamsAllowedValues`
+  helpers.
+- Removed: `LocationParams`, an exported type that was a duplicate of
+  `ParamsOutput` and referenced nowhere, in this repo or any consumer.
+
 ## 0.1.3 — 2026-07-10
 
 - Fix: `CallableRoute` now distributes over union definitions. Previously

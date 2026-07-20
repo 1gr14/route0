@@ -17,9 +17,12 @@ import type {
   IsParamsOptional,
   IsSameParams,
   KnownLocation,
+  ParamsAllowedValues,
+  ParamsDefinition,
   ParamsInput,
   ParamsInputStringOnly,
   ParamsOutput,
+  ParamsValues,
   RoutesPretty,
   UnknownLocation,
   UnknownSearchInput,
@@ -1995,10 +1998,11 @@ describe('specificity', () => {
     const longer = Route0.create('/a/:id/b/:name')
     const shorter = Route0.create('/a/:id')
 
-    // Both have same pattern for overlapping segments: static then param
-    // Falls back to lexicographic: '/a/:id' < '/a/:id/b/:name'
-    expect(longer.isMoreSpecificThan(shorter)).toBe(false)
-    expect(shorter.isMoreSpecificThan(longer)).toBe(true)
+    // The overlapping segments tie, then position 2 is "absent" for the shorter route vs a static `b` for the longer
+    // one. A segment that demands a value outranks an absent one, so the longer route is more specific. The two
+    // languages are disjoint (2 segments vs 4), so this affects ordering identity only, never resolution.
+    expect(longer.isMoreSpecificThan(shorter)).toBe(true)
+    expect(shorter.isMoreSpecificThan(longer)).toBe(false)
   })
 
   it('isMoreSpecificThan: static at earlier position wins', () => {
@@ -2096,6 +2100,24 @@ describe('specificity', () => {
 
   it('isOverlap: undefined returns false', () => {
     expect(Route0.create('/users').isOverlap(undefined)).toBe(false)
+  })
+
+  it('isOverlap: finds an overlap whose witness needs the other route`s own literal', () => {
+    // Regression against any return to probing params with invented values. The previous implementation enumerated
+    // candidate paths using 'x'/'y' for every param, so it missed every overlap whose witness URL requires a param to
+    // take a value drawn from the OTHER route's vocabulary — a static segment, or a constraint value.
+    expect(Route0.create('/:a/x').isOverlap('/x/:b')).toBe(true) // witness: /x/x
+    expect(Route0.create('/users/:id').isOverlap('/:section/new')).toBe(true) // witness: /users/new
+    expect(Route0.create('/:l(ru|en)/x').isOverlap('/ru/:b')).toBe(true) // witness: /ru/x
+    expect(Route0.create('/a/:p').isOverlap('/b/:q')).toBe(false) // no witness: the statics disagree
+  })
+
+  it('isOverlap: stays exact on a route wide enough to blow a bounded candidate set', () => {
+    // Ten optional params is 3^10 combinations — far past any fixed cap on an enumerated candidate list.
+    const wide = '/base/:a?/:b?/:c?/:d?/:e?/:f?/:g?/:h?/:i?/:j?'
+    expect(Route0.create(wide).isOverlap('/base/1/2/3/4/5/6/7/8/9/10')).toBe(true)
+    expect(Route0.create(wide).isOverlap('/base')).toBe(true)
+    expect(Route0.create(wide).isOverlap('/other/1')).toBe(false)
   })
 
   it('isConflict: same-language routes conflict', () => {
@@ -2562,8 +2584,12 @@ describe('ordering', () => {
 
     // Pure specificity order (more specific first), so the param catch-all `/:slug` sinks below every static-prefixed
     // route it competes with. `/:slug` only overlaps the depth-1 routes (`/`, `/users`) and must lose to both.
+    // A shorter route outranks a longer one whose extra segment is a generic param, so `/users` precedes `/users/:id`.
+    // For these particular pairs that is listing order only, since their languages are disjoint. That is NOT a general
+    // rule: when the shared prefix ends in an optional segment, both routes can match the same URL and this order
+    // decides the winner — see the realigning-pair tests in "ordering: matching is correct…" below.
 
-    expect(ordering).toEqual(['/', '/users', '/users/:id', '/users/:id/posts', '/:slug'])
+    expect(ordering).toEqual(['/', '/users', '/users/:id/posts', '/users/:id', '/:slug'])
   })
 
   it('_makeOrdering: handles routes with same specificity', () => {
@@ -2587,7 +2613,9 @@ describe('ordering', () => {
       app: '/app',
     }
     const { pathsOrdering: ordering } = Routes._.makeOrdering(routes)
-    expect(ordering).toEqual(['/app', '/app/home', '/app*'])
+    // `/app/home` outranks `/app` (a required segment beats an absent one); both still beat the wildcard, which is
+    // what this test is really about — `/app` must resolve to `/app`, not to `/app*`.
+    expect(ordering).toEqual(['/app/home', '/app', '/app*'])
   })
 
   it('_makeOrdering: mixed optional and required params are deterministic', () => {
@@ -2622,17 +2650,18 @@ describe('ordering', () => {
 
     // Pure specificity order (more specific first). Static-prefixed routes come before param/wildcard ones segment by
     // segment; the bare param catch-all `/:slug` and the bare wildcard `/*` sink to the end (in that order, since a
-    // required param outranks a wildcard).
+    // required param outranks a wildcard). `/api/v1/users` rises above `/api/v1/users/:id` because a generic param
+    // tail does not take a URL from its own prefix — those languages are disjoint, so nothing re-resolves.
 
     expect(ordering).toEqual([
-      '/',
-      '/special',
-      '/api/v1',
-      '/api/v1/users',
       '/api/v1/users/all',
+      '/api/v1/users',
+      '/api/v1/users/:id/posts',
       '/api/v1/admin/:id',
       '/api/v1/users/:id',
-      '/api/v1/users/:id/posts',
+      '/api/v1',
+      '/',
+      '/special',
       '/:slug',
       '/*',
     ])
@@ -2647,9 +2676,12 @@ describe('ordering', () => {
 
     expect(routes._.pathsOrdering).toBeDefined()
     expect(Array.isArray(routes._.pathsOrdering)).toBe(true)
-    // Depth 1: /, /users (alphabetically)
-    // Depth 2: /users/:id
+    // Depth 1 alphabetically, then `/users/:id` — a generic param tail sorts below its own prefix. All three
+    // languages are disjoint, so each URL still resolves to the only route that matches it.
     expect(routes._.pathsOrdering).toEqual(['/', '/users', '/users/:id'])
+    expect(routes._.getLocation('/').route).toBe('/')
+    expect(routes._.getLocation('/users').route).toBe('/users')
+    expect(routes._.getLocation('/users/42').route).toBe('/users/:id')
   })
 
   it('ordering is preserved after clone', () => {
@@ -2825,6 +2857,45 @@ describe('ordering: matching is correct and insertion-order independent', () => 
       ['/users/42', '/users/:id'],
       ['/users/a/b', '/users/*'],
     ])
+  })
+
+  it('a generic param tail does not steal a URL from its own prefix (realigning pair)', () => {
+    // `/x/:p?` and `/x/:p?/:q` both match `/x/v`: skipping the shared optional segment realigns `:q` onto `v`. Their
+    // languages are NOT disjoint, so the specificity order decides — and the prefix must win, or every two-segment
+    // route would swallow its own parent. Ranking absence above a plain required param is what guarantees it.
+    expectStableMatching({ short: '/x/:p?', long: '/x/:p?/:q' }, [
+      ['/x', '/x/:p?'],
+      ['/x/v', '/x/:p?'],
+      ['/x/a/b', '/x/:p?/:q'],
+    ])
+    const routes = Routes.create({ short: '/x/:p?', long: '/x/:p?/:q' })
+    expect(routes._.getLocation('/x/v').params).toEqual({ p: 'v' })
+  })
+
+  it('a constrained tail DOES reclaim the shared URL (the locale-prefix blog shape)', () => {
+    // The mirror image: `:kind(new|top)` names a finite set, so `/new` belongs to it and everything else still falls
+    // through to the prefix. This is the whole point of constraints, and the reason absence sits below them.
+    expectStableMatching({ home: '/:locale(ru|en)?', kind: '/:locale(ru|en)?/:kind(new|top)' }, [
+      ['/', '/:locale(ru|en)?'],
+      ['/ru', '/:locale(ru|en)?'],
+      ['/new', '/:locale(ru|en)?/:kind(new|top)'],
+      ['/ru/top', '/:locale(ru|en)?/:kind(new|top)'],
+    ])
+  })
+
+  it('a locale prefix coexists with a catch-all slug (the imminent blog shape)', () => {
+    // `/:locale(ru|en)?` + `/:locale(ru|en)?/:slug`: `/ru` must be the home page in Russian, NOT the post `ru`.
+    expectStableMatching({ home: '/:locale(ru|en)?', post: '/:locale(ru|en)?/:slug' }, [
+      ['/', '/:locale(ru|en)?'],
+      ['/ru', '/:locale(ru|en)?'],
+      ['/en', '/:locale(ru|en)?'],
+      ['/hello', '/:locale(ru|en)?/:slug'],
+      ['/ru/hello', '/:locale(ru|en)?/:slug'],
+    ])
+    const routes = Routes.create({ home: '/:locale(ru|en)?', post: '/:locale(ru|en)?/:slug' })
+    expect(routes._.getLocation('/ru').params).toEqual({ locale: 'ru' })
+    expect(routes._.getLocation('/hello').params).toEqual({ slug: 'hello' })
+    expect(routes._.getLocation('/ru/hello').params).toEqual({ locale: 'ru', slug: 'hello' })
   })
 
   it('deep static-prefixed route wins over a shallow param (the impersonate case)', () => {
@@ -3103,5 +3174,669 @@ describe('Infer', () => {
     const narrowed = route.search<{ q: string; page?: number }>()
     expect(narrowed.get({ '?': { q: 'a', page: 2 } })).toBe('/search?q=a&page=2')
     expectTypeOf<typeof narrowed.Infer.SearchInput>().toEqualTypeOf<{ q: string; page?: number }>()
+  })
+})
+
+describe('param constraints: the locale case', () => {
+  const routes = Routes.create({
+    home: '/:locale(ru|en)?',
+    author: '/:locale(ru|en)?/author',
+  })
+
+  it('resolves /author to the author route, not home with locale="author"', () => {
+    // The bug this feature exists to kill: without constraints (and without the absent-segment ordering fix)
+    // '/author' matched '/:locale?' first and bound locale='author'.
+    const loc = routes._.getLocation('/author')
+    expect(loc.route).toBe('/:locale(ru|en)?/author')
+    expect(loc.params).toEqual({ locale: undefined })
+  })
+
+  it('resolves /ru/author to the author route with locale="ru"', () => {
+    const loc = routes._.getLocation('/ru/author')
+    expect(loc.route).toBe('/:locale(ru|en)?/author')
+    expect(loc.params).toEqual({ locale: 'ru' })
+  })
+
+  it('resolves /en/author too', () => {
+    const loc = routes._.getLocation('/en/author')
+    expect(loc.route).toBe('/:locale(ru|en)?/author')
+    expect(loc.params).toEqual({ locale: 'en' })
+  })
+
+  it('does not resolve /zz/author at all', () => {
+    // 'zz' is not an allowed locale, so no route matches — a real 404 rather than a bogus binding.
+    const loc = routes._.getLocation('/zz/author')
+    expect(loc.route).toBeUndefined()
+    expect(loc.params).toBeUndefined()
+    expect(loc.pathname).toBe('/zz/author')
+  })
+
+  it('resolves / to home with locale undefined', () => {
+    const loc = routes._.getLocation('/')
+    expect(loc.route).toBe('/:locale(ru|en)?')
+    expect(loc.params).toEqual({ locale: undefined })
+  })
+
+  it('resolves /ru to home with locale="ru"', () => {
+    const loc = routes._.getLocation('/ru')
+    expect(loc.route).toBe('/:locale(ru|en)?')
+    expect(loc.params).toEqual({ locale: 'ru' })
+  })
+
+  it('does not resolve a non-locale single segment', () => {
+    expect(routes._.getLocation('/zz').route).toBeUndefined()
+  })
+
+  it('orders the deeper route first', () => {
+    expect(routes._.pathsOrdering).toEqual(['/:locale(ru|en)?/author', '/:locale(ru|en)?'])
+  })
+
+  it('is insertion-order independent', () => {
+    const reversed = Routes.create({
+      author: '/:locale(ru|en)?/author',
+      home: '/:locale(ru|en)?',
+    })
+    expect(reversed._.pathsOrdering).toEqual(routes._.pathsOrdering)
+    expect(reversed._.getLocation('/author').route).toBe('/:locale(ru|en)?/author')
+  })
+})
+
+describe('param constraints: the absent-segment fix stands alone', () => {
+  it('resolves /author correctly even WITHOUT constraints', () => {
+    // Pinned separately so the ordering fix cannot be mistaken for something constraints deliver.
+    const routes = Routes.create({
+      home: '/:locale?',
+      author: '/:locale?/author',
+    })
+    expect(routes._.getLocation('/author').route).toBe('/:locale?/author')
+    expect(routes._.getLocation('/ru').route).toBe('/:locale?')
+  })
+
+  it('still prefers the exact static route over an optional/wildcard tail', () => {
+    // What Number.POSITIVE_INFINITY was protecting — must survive the fix.
+    expect(Route0.create('/users').isMoreSpecificThan('/users/:id?')).toBe(true)
+    expect(Route0.create('/users').isMoreSpecificThan('/users/*?')).toBe(true)
+    expect(Route0.create('/files').isMoreSpecificThan('/files/*')).toBe(true)
+    expect(Route0.create('/').isMoreSpecificThan('/:locale?')).toBe(true)
+  })
+})
+
+describe('param constraints: grammar and tokens', () => {
+  it('tokenizes a constrained param', () => {
+    expect(Route0.create('/:locale(ru|en)?/author').getTokens()).toEqual([
+      { kind: 'param', name: 'locale', optional: true, values: ['ru', 'en'] },
+      { kind: 'static', value: 'author' },
+    ])
+    expect(Route0.create('/:kind(new)').getTokens()).toEqual([
+      { kind: 'param', name: 'kind', optional: false, values: ['new'] },
+    ])
+  })
+
+  it('leaves an unconstrained param token shape untouched', () => {
+    expect(Route0.create('/users/:id').getTokens()).toEqual([
+      { kind: 'static', value: 'users' },
+      { kind: 'param', name: 'id', optional: false },
+    ])
+  })
+
+  it('omits `values` entirely rather than emitting a null/undefined placeholder', () => {
+    // toEqual treats a missing key and an explicit undefined as equal, so assert on the key set instead: consumers
+    // that walk tokens (point0's OpenAPI path builder, for one) branch on presence.
+    const [, plain] = Route0.create('/users/:id').getTokens()
+    expect(Object.keys(plain)).toEqual(['kind', 'name', 'optional'])
+    expect('values' in plain).toBe(false)
+    const [constrained] = Route0.create('/:locale(ru|en)').getTokens()
+    expect(Object.keys(constrained)).toEqual(['kind', 'name', 'optional', 'values'])
+  })
+
+  it('accepts every URL-unreserved character in an allowed value', () => {
+    // The value set is restricted to unreserved characters precisely so encoded and decoded forms are identical.
+    expect(Route0.create('/:name(a.b|c-d|e~f|g_h)').getTokens()).toEqual([
+      { kind: 'param', name: 'name', optional: false, values: ['a.b', 'c-d', 'e~f', 'g_h'] },
+    ])
+  })
+
+  it('keeps ":id*" a wildcard with a ":id" prefix', () => {
+    // Legal since long before constraints: the ':' here is literal prefix text, not a param marker. Tightening the
+    // param grammar must not swallow it.
+    expect(Route0.create('/:id*').getTokens()).toEqual([{ kind: 'wildcard', prefix: ':id', optional: false }])
+    expect(Route0.create('/:id*?').getTokens()).toEqual([{ kind: 'wildcard', prefix: ':id', optional: true }])
+    expect(Route0.create('/:id*').params).toEqual({ '*': true })
+    expect(Route0.create('/:id*?').params).toEqual({ '*': false })
+    expect(Route0.create('/:id*').get({ '*': '42' })).toBe('/:id42')
+  })
+
+  it('types ":id*" as a wildcard too, not as a param called "id*"', () => {
+    // Regression: the type-level segment reader used to try `:${Name}` before the wildcard branches, so this route
+    // typed its params as `{ 'id*': true }` while the runtime reported `{ '*': true }` — `get({ '*': … })` was a
+    // compile error on a route that works.
+    const route = Route0.create('/:id*')
+    expect(route.get({ '*': '42' })).toBe('/:id42')
+    expectTypeOf(route.params).toEqualTypeOf<{ '*': true }>()
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{ '*': string }>()
+    expectTypeOf<ParamsValues<'/:id*'>>().toEqualTypeOf<{ '*': string }>()
+
+    const optional = Route0.create('/:id*?')
+    expect(optional.get({})).toBe('/:id')
+    expectTypeOf(optional.params).toEqualTypeOf<{ '*': false }>()
+    expectTypeOf<typeof optional.Infer.ParamsOutput>().toEqualTypeOf<{ '*': string | undefined }>()
+  })
+
+  it('exposes allowed values', () => {
+    expect(Route0.create('/:locale(ru|en)?/post/:slug').getParamsValues()).toEqual({ locale: ['ru', 'en'] })
+    expect(Route0.create('/users/:id').getParamsValues()).toEqual({})
+  })
+
+  it('hands out a copy of the allowed values, not the route internals', () => {
+    const route = Route0.create('/:locale(ru|en)')
+    const values = route.getParamsValues() as { locale: string[] }
+    values.locale.push('de')
+    expect(route.getParamsValues()).toEqual({ locale: ['ru', 'en'] })
+    expect(route.isExact('/de')).toBe(false)
+  })
+
+  it('hands out a copy of a token`s values too', () => {
+    // `values` is the only non-primitive on a token: before it existed the shallow spread in getTokens() was a full
+    // copy, and losing that quietly let a caller widen what the route matches.
+    const route = Route0.create('/:locale(ru|en)')
+    const [token] = route.getTokens()
+    if (token.kind !== 'param' || !token.values) {
+      throw new Error('expected a constrained param token')
+    }
+    // `readonly` is the type-level guard; this cast is the point of the test — prove the runtime array is a copy
+    ;(token.values as string[]).push('de')
+    expect(route.getTokens()).toEqual([{ kind: 'param', name: 'locale', optional: false, values: ['ru', 'en'] }])
+    expect(route.getParamsValues()).toEqual({ locale: ['ru', 'en'] })
+    expect(route.isExact('/de')).toBe(false)
+  })
+
+  it('keeps params meaning "is required"', () => {
+    expect(Route0.create('/:locale(ru|en)?/post/:slug').params).toEqual({ locale: false, slug: true })
+    expect(Route0.create('/:locale(ru|en)?').getParamsKeys()).toEqual(['locale'])
+  })
+})
+
+describe('param constraints: definition validation', () => {
+  /** Returns the rejection message, or fails loudly if the definition was accepted. */
+  const messageOf = (definition: string): string => {
+    try {
+      Route0.create(definition)
+    } catch (error) {
+      return (error as Error).message
+    }
+    throw new Error(`Expected "${definition}" to be rejected, but it was accepted`)
+  }
+
+  // Before the grammar existed, every one of these silently became a STATIC literal that could never match, and
+  // regexDescendantMatchers invented a phantom param out of the leftovers. They must all throw.
+  const malformed: Array<[definition: string, why: string]> = [
+    ['/:na-me', 'a hyphen is not part of the name grammar'],
+    ['/:name-x', 'same, with the hyphen at the end'],
+    ['/:id.json', 'a dot is not part of the name grammar either'],
+    ['/:', 'no name at all'],
+    ['/:(ru|en)', 'constraint but no name'],
+    ['/:name(', 'the paren is never closed'],
+    ['/:name(a|b', 'same, with values written out'],
+    ['/:name()', 'empty constraint'],
+    ['/:name(|b)', 'empty leading value'],
+    ['/:name(a|)', 'empty trailing value'],
+    ['/:name(a||b)', 'empty value in the middle'],
+    ['/:name(a/b)', 'a slash inside a constraint is unrepresentable — segments are split on it'],
+    ['/:name(a b)', 'a space is not an allowed value character'],
+    ['/:locale(ру|en)', 'a non-ASCII value'],
+    ['/:locale(ru|én)', 'a non-ASCII accent in an otherwise ASCII value'],
+    ['/:locale(ru|en]', 'mismatched bracket'],
+    ['/:name(a|b)x', 'trailing garbage after the constraint'],
+    ['/:name(a)(b)', 'two constraints on one param'],
+    ['/:name?(a|b)', 'the "?" goes after the constraint, not before'],
+    ['/:locale(ru|en)??', 'a doubled "?"'],
+  ]
+  for (const [definition, why] of malformed) {
+    it(`rejects ${definition} — ${why}`, () => {
+      expect(() => Route0.create(definition)).toThrow(/Invalid route definition/)
+    })
+  }
+
+  it('states the whole grammar in the message', () => {
+    expect(messageOf('/:na-me')).toContain('Expected ":name", ":name?", ":name(a|b)" or ":name(a|b)?"')
+    expect(messageOf('/:na-me')).toContain('the name is [A-Za-z0-9_]+')
+    expect(messageOf('/:na-me')).toContain('each allowed value is [A-Za-z0-9_.~-]+')
+  })
+
+  it('blames the "(" only when it is genuinely unbalanced', () => {
+    expect(messageOf('/:name(a/b)')).toContain('The "(" is never closed')
+    expect(messageOf('/:name(a|b')).toContain('The "(" is never closed')
+    expect(messageOf('/:na-me')).not.toContain('never closed')
+    expect(messageOf('/:name()')).not.toContain('never closed')
+  })
+
+  it('quotes only the segment head when a "/" split the constraint', () => {
+    // The author wrote ':name(a/b)', but '/' splitting means validation only ever sees ':name(a' — hence the hint.
+    expect(messageOf('/:name(a/b)')).toContain('malformed param segment ":name(a"')
+  })
+
+  it('throws above the alternatives cap instead of leaving TypeScript to blow up', () => {
+    const many = Array.from({ length: 33 }, (_, i) => `v${i}`).join('|')
+    expect(() => Route0.create(`/:x(${many})`)).toThrow(/has 33 allowed values, the maximum is 32/)
+    const ok = Array.from({ length: 32 }, (_, i) => `v${i}`).join('|')
+    expect(() => Route0.create(`/:x(${ok})`)).not.toThrow()
+  })
+
+  it('throws on a duplicate constraint value', () => {
+    expect(() => Route0.create('/:locale(ru|ru)')).toThrow(/duplicate constraint value "ru"/)
+    expect(() => Route0.create('/:locale(ru|en|ru)')).toThrow(/duplicate constraint value "ru"/)
+  })
+
+  it('throws on a duplicate param name', () => {
+    expect(() => Route0.create('/x/:id/y/:id')).toThrow(/duplicate param name "id"/)
+    expect(() => Route0.create('/:id(a|b)/y/:id')).toThrow(/duplicate param name "id"/)
+  })
+
+  it('throws on a constraint attached to a wildcard', () => {
+    expect(() => Route0.create('/files/*(a|b)')).toThrow(/wildcard cannot carry a value constraint/)
+  })
+
+  it('still accepts every pre-existing shape', () => {
+    const legal = ['/', '/users', '/users/:id', '/users/:id?', '/files/*', '/files/*?', '/app*', '/app*?', '/:id*']
+    for (const definition of legal) {
+      expect(() => Route0.create(definition)).not.toThrow()
+    }
+  })
+
+  it('validates on every construction path, not just Route0.create', () => {
+    expect(() => Route0.from('/:na-me')).toThrow(/Invalid route definition/)
+    expect(() => Route0.create('/ok').extend('/:na-me')).toThrow(/Invalid route definition/)
+    expect(() => Routes.create({ bad: '/:na-me' })).toThrow(/Invalid route definition/)
+  })
+})
+
+describe('param constraints: matching', () => {
+  it('emits exactly one capture group per param', () => {
+    expect(Route0.create('/:locale(ru|en)?/author').regexBaseString).toBe('(?:/((?:ru|en)))?/author/?')
+    expect(Route0.create('/:locale(ru|en)/x').regexBaseString).toBe('/((?:ru|en))/x/?')
+    // unchanged for unconstrained params
+    expect(Route0.create('/users/:id').regexBaseString).toBe('/users/([^/]+)/?')
+  })
+
+  it('escapes regex metacharacters in allowed values', () => {
+    const route = Route0.create('/:name(a.b|c-d)')
+    expect(route.regexBaseString).toBe('/((?:a\\.b|c-d))/?')
+    expect(route.isExact('/a.b')).toBe(true)
+    expect(route.isExact('/axb')).toBe(false)
+  })
+
+  it('matches only allowed values', () => {
+    const route = Route0.create('/:locale(ru|en)?/author')
+    expect(route.isExact('/ru/author')).toBe(true)
+    expect(route.isExact('/en/author')).toBe(true)
+    expect(route.isExact('/author')).toBe(true)
+    expect(route.isExact('/ru/author/')).toBe(true)
+    expect(route.isExact('/fr/author')).toBe(false)
+    expect(route.isExact('/RU/author')).toBe(false) // case-sensitive, like static segments
+  })
+
+  it('keeps capture keys aligned when constrained, unconstrained and wildcard params mix', () => {
+    const route = Route0.create('/:locale(ru|en)/post/:slug/files/*')
+    const relation = route.getRelation('/ru/post/hello/files/a/b.txt')
+    expect(relation.exact).toBe(true)
+    expect(relation.params).toEqual({ locale: 'ru', slug: 'hello', '*': 'a/b.txt' })
+  })
+
+  it('extracts the constrained param on an ancestor match', () => {
+    const relation = Route0.create('/:locale(ru|en)?').getRelation('/ru/author')
+    expect(relation.ancestor).toBe(true)
+    expect(relation.params).toEqual({ locale: 'ru' })
+  })
+
+  it('uses the constraint in descendant matchers too', () => {
+    // regexDescendantMatchers is a second regex builder; before this change it produced the capture key
+    // 'locale(ru|en)' and an unconstrained body.
+    const route = Route0.create('/:locale(ru|en)?/author')
+    expect(route.isDescendant('/ru')).toBe(true)
+    expect(route.isDescendant('/fr')).toBe(false)
+  })
+
+  it('honours the constraint inside a combined regex group', () => {
+    const routes = Routes.create({ home: '/:locale(ru|en)?', author: '/:locale(ru|en)?/author' })
+    const group = Route0.getRegexGroup([routes.home, routes.author])
+    expect(group.test('/ru/author')).toBe(true)
+    expect(group.test('/fr/author')).toBe(false)
+  })
+})
+
+describe('param constraints: building', () => {
+  const route = Route0.create('/:locale(ru|en)?/author')
+
+  it('builds from an allowed value', () => {
+    expect(route.get({ locale: 'ru' })).toBe('/ru/author')
+    expect(route.get({ locale: 'en' })).toBe('/en/author')
+  })
+
+  it('omits an absent optional constrained param', () => {
+    expect(route.get({})).toBe('/author')
+  })
+
+  it('throws on a disallowed value', () => {
+    // @ts-expect-error 'fr' is not an allowed locale
+    expect(() => route.get({ locale: 'fr' })).toThrow(
+      'Invalid params for route "/:locale(ru|en)?/author": "locale" must be one of "ru", "en" (received "fr")',
+    )
+  })
+
+  it('never leaks the constraint into the produced URL', () => {
+    expect(Route0.create('/:locale(ru|en)/post/:slug').get({ locale: 'en', slug: 'hi' })).toBe('/en/post/hi')
+    expect(route.get({ locale: 'ru' })).not.toContain('(')
+  })
+
+  it('leaves unconstrained building byte-identical', () => {
+    expect(Route0.create('/users/:id').get({ id: 42 })).toBe('/users/42')
+    expect(Route0.create('/users/:id?').get({})).toBe('/users')
+    expect(Route0.create('/:a?').get({})).toBe('/')
+    expect(Route0.create('/files/*').get({ '*': 'a/b' })).toBe('/files/a/b')
+    expect(Route0.create('/users/:id').get({ id: 'a b' })).toBe('/users/a%20b')
+  })
+})
+
+describe('param constraints: schema and JSON Schema', () => {
+  const route = Route0.create('/:locale(ru|en)?/post/:slug')
+
+  it('rejects a disallowed value through Standard Schema', () => {
+    const result = route.schema.safeParse({ locale: 'fr', slug: 'x' })
+    expect(result.success).toBe(false)
+    expect(result.error?.message).toContain('"locale" must be one of "ru", "en"')
+  })
+
+  it('accepts an allowed value', () => {
+    const result = route.schema.safeParse({ locale: 'ru', slug: 'x' })
+    expect(result.success).toBe(true)
+    expect(result.data).toEqual({ locale: 'ru', slug: 'x' })
+  })
+
+  it('reports the failing key as the issue path', () => {
+    const result = route.schema['~standard'].validate({ locale: 'fr', slug: 'x' })
+    expect('issues' in result && result.issues?.[0]?.path).toEqual(['locale'])
+  })
+
+  it('emits enum in the input JSON schema and drops the number branch', () => {
+    const schema = route.schema['~standard'].jsonSchema.input({ target: 'draft-2020-12' }) as {
+      properties: Record<string, unknown>
+      required: string[]
+    }
+    expect(schema.properties.locale).toEqual({ type: 'string', enum: ['ru', 'en'] })
+    expect(schema.properties.slug).toEqual({ anyOf: [{ type: 'string' }, { type: 'number' }] })
+    expect(schema.required).toEqual(['slug'])
+  })
+
+  it('emits enum in the output JSON schema', () => {
+    const schema = route.schema['~standard'].jsonSchema.output({ target: 'draft-2020-12' }) as {
+      properties: Record<string, unknown>
+    }
+    expect(schema.properties.locale).toEqual({ type: 'string', enum: ['ru', 'en'] })
+    expect(schema.properties.slug).toEqual({ type: 'string' })
+  })
+
+  it('keeps the enum on draft-07 as well', () => {
+    // Whatever the target, the enum is the part an OpenAPI consumer needs — it is what makes the generated client
+    // reject '/fr/post/x' before the request leaves the browser.
+    expect(route.schema['~standard'].jsonSchema.input({ target: 'draft-07' })).toMatchObject({
+      $schema: 'http://json-schema.org/draft-07/schema#',
+      properties: { locale: { type: 'string', enum: ['ru', 'en'] } },
+      required: ['slug'],
+    })
+    expect(route.schema['~standard'].jsonSchema.output({ target: 'draft-07' })).toMatchObject({
+      properties: { locale: { type: 'string', enum: ['ru', 'en'] }, slug: { type: 'string' } },
+    })
+  })
+})
+
+describe('param constraints: specificity and conflicts', () => {
+  it('ranks a constrained param above an unconstrained one at the same optionality', () => {
+    expect(Route0.create('/:locale(ru|en)/x').isMoreSpecificThan('/:id/x')).toBe(true)
+    expect(Route0.create('/:locale(ru|en)?/x').isMoreSpecificThan('/:tab?/x')).toBe(true)
+  })
+
+  it('keeps static above a constrained param, and a constrained param above a wildcard', () => {
+    expect(Route0.create('/ru/x').isMoreSpecificThan('/:locale(ru|en)/x')).toBe(true)
+    expect(Route0.create('/:locale(ru|en)?/x').isMoreSpecificThan('/*')).toBe(true)
+  })
+
+  it('probes overlap with the real allowed values', () => {
+    // With 'x'/'y' probes this was false for every constrained route, silently disabling conflict detection.
+    expect(Route0.create('/:locale(ru|en)/x').isOverlap('/:id/x')).toBe(true)
+    expect(Route0.create('/:locale(ru|en)/x').isOverlap('/ru/x')).toBe(true)
+    expect(Route0.create('/:locale(ru|en)/x').isOverlap('/de/x')).toBe(false)
+  })
+
+  it('treats disjoint value sets as non-conflicting', () => {
+    expect(Route0.create('/:locale(ru|en)/x').isConflict('/:kind(new|old)/x')).toBe(false)
+  })
+
+  it('treats overlapping value sets as conflicting', () => {
+    expect(Route0.create('/:locale(ru|en)/x').isConflict('/:other(en|de)/x')).toBe(true)
+  })
+
+  it('treats a constrained param vs a free one as orderable, not a conflict', () => {
+    expect(Route0.create('/:locale(ru|en)/x').isConflict('/:id/x')).toBe(false)
+  })
+})
+
+describe('param constraints: derived routes', () => {
+  const base = Route0.create('/:locale(ru|en)?')
+
+  it('carries the constraint through extend, clone, from and create', () => {
+    const derived = [
+      base.extend('/author'),
+      base.clone(),
+      Route0.from(base),
+      Route0.create(base),
+      Route0.from('/:locale(ru|en)?'),
+    ]
+    for (const route of derived) {
+      expect(route.getParamsValues()).toEqual({ locale: ['ru', 'en'] })
+      expect(route.get({ locale: 'ru' })).toContain('/ru')
+      expect(() => route.get({ locale: 'fr' as 'ru' })).toThrow(/must be one of "ru", "en"/)
+    }
+  })
+
+  it('extends into a definition that still carries the constraint verbatim', () => {
+    expect(base.extend('/author').definition).toBe('/:locale(ru|en)?/author')
+    expect(base.extend('/post/:slug').definition).toBe('/:locale(ru|en)?/post/:slug')
+  })
+})
+
+describe('param constraints: type inference', () => {
+  it('infers a literal union for a constrained param', () => {
+    expectTypeOf<ParamsInput<'/:locale(ru|en)'>>().toEqualTypeOf<{ locale: 'ru' | 'en' }>()
+    expectTypeOf<ParamsInput<'/:locale(ru|en)?'>>().toEqualTypeOf<{ locale?: 'ru' | 'en' | undefined }>()
+    expectTypeOf<ParamsOutput<'/:locale(ru|en)?/author'>>().toEqualTypeOf<{ locale: 'ru' | 'en' | undefined }>()
+    expectTypeOf<ParamsOutput<'/:locale(ru|en)/post/:slug'>>().toEqualTypeOf<{
+      locale: 'ru' | 'en'
+      slug: string
+    }>()
+  })
+
+  it('handles a single alternative and digit-looking alternatives', () => {
+    expectTypeOf<ParamsInput<'/:kind(new)'>>().toEqualTypeOf<{ kind: 'new' }>()
+    // '1' and '2' are the STRINGS, never the numbers
+    expectTypeOf<ParamsInput<'/v/:ver(1|2)'>>().toEqualTypeOf<{ ver: '1' | '2' }>()
+  })
+
+  it('produces a clean param key (no parens leaking into the name)', () => {
+    const route = Route0.create('/:locale(ru|en)?')
+    // `Infer` is a type-only carrier (`null as never`), so it must never be touched at runtime.
+    expectTypeOf(route.params).toEqualTypeOf<{ locale: false }>()
+    expectTypeOf<(typeof route.Infer)['ParamsValues']>().toEqualTypeOf<{ locale: 'ru' | 'en' }>()
+    expectTypeOf<(typeof route.Infer)['ParamsDefinition']>().toEqualTypeOf<{ locale: false }>()
+  })
+
+  it('mixes constrained, unconstrained and wildcard params', () => {
+    expectTypeOf<ParamsOutput<'/:locale(ru|en)?/:env(dev|prod)/:id/files/*'>>().toEqualTypeOf<{
+      locale: 'ru' | 'en' | undefined
+      env: 'dev' | 'prod'
+      id: string
+      '*': string
+    }>()
+  })
+
+  it('leaves unconstrained inference byte-identical', () => {
+    expectTypeOf<ParamsInput<'/user/:id/:tab?'>>().toEqualTypeOf<{
+      id: string | number
+      tab?: string | number | undefined
+    }>()
+    expectTypeOf<ParamsOutput<'/user/:id/:tab?'>>().toEqualTypeOf<{ id: string; tab: string | undefined }>()
+    expectTypeOf<ParamsInput<'/about'>>().toEqualTypeOf<Record<never, never>>()
+    expectTypeOf<ParamsOutput<'/files/*'>>().toEqualTypeOf<{ '*': string }>()
+  })
+
+  it('narrows every Infer member at once', () => {
+    const route = Route0.create('/:locale(ru|en)?/post/:slug')
+    expect(route.get({ locale: 'ru', slug: 'hi' })).toBe('/ru/post/hi')
+
+    expectTypeOf<typeof route.Infer.ParamsDefinition>().toEqualTypeOf<{ locale: false; slug: true }>()
+    expectTypeOf<typeof route.Infer.ParamsValues>().toEqualTypeOf<{ locale: 'ru' | 'en'; slug: string }>()
+    expectTypeOf<typeof route.Infer.ParamsInput>().toEqualTypeOf<{
+      slug: string | number
+      locale?: 'ru' | 'en' | undefined
+    }>()
+    expectTypeOf<typeof route.Infer.ParamsInputStringOnly>().toEqualTypeOf<{
+      slug: string
+      locale?: 'ru' | 'en' | undefined
+    }>()
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{
+      locale: 'ru' | 'en' | undefined
+      slug: string
+    }>()
+  })
+
+  it('exposes the value domain through the public helpers', () => {
+    expectTypeOf<ParamsValues<'/:locale(ru|en)?/post/:slug'>>().toEqualTypeOf<{ locale: 'ru' | 'en'; slug: string }>()
+    expectTypeOf<ParamsAllowedValues<'/:locale(ru|en)?/post/:slug'>>().toEqualTypeOf<{
+      locale: readonly ('ru' | 'en')[]
+    }>()
+    expectTypeOf<ParamsDefinition<'/:locale(ru|en)?/post/:slug'>>().toEqualTypeOf<{ locale: false; slug: true }>()
+    // An unconstrained param's domain is exactly `string` — that is the test everything else keys off.
+    expectTypeOf<ParamsValues<'/user/:id/:tab?'>>().toEqualTypeOf<{ id: string; tab: string }>()
+    expectTypeOf<ParamsAllowedValues<'/user/:id/:tab?'>>().toEqualTypeOf<Record<never, never>>()
+  })
+
+  it('types getParamsValues() as literal values, constrained keys only', () => {
+    const route = Route0.create('/:locale(ru|en)?/post/:slug')
+    expect(route.getParamsValues()).toEqual({ locale: ['ru', 'en'] })
+    expectTypeOf(route.getParamsValues()).toEqualTypeOf<{ locale: readonly ('ru' | 'en')[] }>()
+    expectTypeOf(Route0.create('/users/:id').getParamsValues()).toEqualTypeOf<Record<never, never>>()
+  })
+
+  it('narrows getRelation params to the union', () => {
+    const route = Route0.create('/:locale(ru|en)?/author')
+    const relation = route.getRelation('/ru/author')
+    expect(relation.params).toEqual({ locale: 'ru' })
+    if (relation.type !== 'exact') {
+      throw new Error('expected an exact relation')
+    }
+    expectTypeOf(relation.params).toEqualTypeOf<{ locale: 'ru' | 'en' | undefined }>()
+    expectTypeOf(relation.params.locale).toEqualTypeOf<'ru' | 'en' | undefined>()
+  })
+
+  it('narrows schema parse and safeParse output', () => {
+    const route = Route0.create('/:locale(ru|en)?/post/:slug')
+    const parsed = route.schema.parse({ locale: 'ru', slug: 'x' })
+    expect(parsed).toEqual({ locale: 'ru', slug: 'x' })
+    expectTypeOf(parsed).toEqualTypeOf<{ locale: 'ru' | 'en' | undefined; slug: string }>()
+    expectTypeOf(parsed.locale).toEqualTypeOf<'ru' | 'en' | undefined>()
+
+    const result = route.schema.safeParse({ locale: 'en', slug: 'x' })
+    expect(result.success).toBe(true)
+    if (!result.success) {
+      throw new Error('expected safeParse to succeed')
+    }
+    expectTypeOf(result.data).toEqualTypeOf<{ locale: 'ru' | 'en' | undefined; slug: string }>()
+  })
+
+  it('carries the union into location params', () => {
+    expectTypeOf<ExactLocation<'/:locale(ru|en)?/author'>['params']>().toEqualTypeOf<{
+      locale: 'ru' | 'en' | undefined
+    }>()
+    expectTypeOf<ExactLocation<'/:locale(ru|en)?/author'>['params']['locale']>().toEqualTypeOf<
+      'ru' | 'en' | undefined
+    >()
+    // unconstrained locations are unchanged
+    expectTypeOf<ExactLocation<'/users/:id'>['params']>().toEqualTypeOf<{ id: string }>()
+  })
+
+  it('keeps the union through extend, search, clone and from', () => {
+    const base = Route0.create('/:locale(ru|en)?')
+    const extended = base.extend('/author')
+    expect(extended.definition).toBe('/:locale(ru|en)?/author')
+    expectTypeOf<(typeof extended)['definition']>().toEqualTypeOf<'/:locale(ru|en)?/author'>()
+    expectTypeOf<typeof extended.Infer.ParamsOutput>().toEqualTypeOf<{ locale: 'ru' | 'en' | undefined }>()
+
+    const searched = base.search<{ q: string }>()
+    expect(searched.get({ locale: 'ru', '?': { q: 'x' } })).toBe('/ru?q=x')
+    expectTypeOf<typeof searched.Infer.ParamsOutput>().toEqualTypeOf<{ locale: 'ru' | 'en' | undefined }>()
+
+    const cloned = base.clone()
+    expect(cloned.get({ locale: 'en' })).toBe('/en')
+    expectTypeOf<typeof cloned.Infer.ParamsOutput>().toEqualTypeOf<{ locale: 'ru' | 'en' | undefined }>()
+
+    const fromString = Route0.from('/:locale(ru|en)?')
+    expect(fromString.get({ locale: 'ru' })).toBe('/ru')
+    expectTypeOf<typeof fromString.Infer.ParamsOutput>().toEqualTypeOf<{ locale: 'ru' | 'en' | undefined }>()
+
+    // @ts-expect-error the constraint survives every derivation
+    expect(() => extended.get({ locale: 'fr' })).toThrow('must be one of "ru", "en"')
+  })
+
+  it('keeps the union through a Routes collection', () => {
+    const routes = Routes.create({
+      home: '/:locale(ru|en)?',
+      author: '/:locale(ru|en)?/author',
+      post: '/:locale(ru|en)?/post/:slug',
+    })
+    expect(routes.author({ locale: 'en' })).toBe('/en/author')
+
+    expectTypeOf<typeof routes.author.Infer.ParamsOutput>().toEqualTypeOf<{ locale: 'ru' | 'en' | undefined }>()
+    expectTypeOf<ParamsOutput<ExtractRoute<typeof routes, 'post'>>>().toEqualTypeOf<{
+      locale: 'ru' | 'en' | undefined
+      slug: string
+    }>()
+
+    // @ts-expect-error 'de' is not an allowed locale
+    expect(() => routes.author({ locale: 'de' })).toThrow('must be one of "ru", "en"')
+  })
+
+  it('rejects disallowed values and numbers at the call site', () => {
+    const route = Route0.create('/:locale(ru|en)?/author')
+    route.get({ locale: 'ru' })
+    route.get({})
+    // @ts-expect-error 'fr' is not an allowed locale
+    expect(() => route.get({ locale: 'fr' })).toThrow()
+    // @ts-expect-error a constrained param does not accept a number
+    expect(() => route.get({ locale: 1 })).toThrow()
+
+    const required = Route0.create('/:locale(ru|en)/author')
+    // @ts-expect-error a required constrained param cannot be omitted
+    expect(() => required.get({})).toThrow(/"locale" is required and must be one of "ru", "en"/)
+  })
+
+  it('narrows abs() exactly like get()', () => {
+    const route = Route0.create('/:locale(ru|en)?/author', { origin: 'https://example.com' })
+    expect(route.abs({ locale: 'ru' })).toBe('https://example.com/ru/author')
+    // @ts-expect-error 'fr' is not an allowed locale
+    expect(() => route.abs({ locale: 'fr' })).toThrow('must be one of "ru", "en"')
+  })
+
+  it('does not let one constrained param borrow another one values', () => {
+    const deploy = Route0.create('/:env(dev|prod)/:tier(free|pro)')
+    expect(deploy.get({ env: 'dev', tier: 'pro' })).toBe('/dev/pro')
+    expectTypeOf<typeof deploy.Infer.ParamsOutput>().toEqualTypeOf<{ env: 'dev' | 'prod'; tier: 'free' | 'pro' }>()
+    // @ts-expect-error 'free' belongs to tier, not env
+    expect(() => deploy.get({ env: 'free', tier: 'pro' })).toThrow('"env" must be one of "dev", "prod"')
+  })
+
+  it('keeps the legacy "undefined" fallback for a missing UNCONSTRAINED required param', () => {
+    // Pre-existing wart, deliberately untouched: only the constrained case throws, because only there do we know the
+    // built URL could never match its own route.
+    // @ts-expect-error id is required
+    expect(Route0.create('/:id/author').get({})).toBe('/undefined/author')
   })
 })

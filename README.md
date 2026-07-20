@@ -100,6 +100,79 @@ A wildcard always lives under the `'*'` key. It may be a whole segment (`/*`) or
 inline within one (`/files/x*`); only one wildcard is allowed, and it must come
 last.
 
+## Restrict a param to a set of values
+
+List the values a param accepts in parentheses. The param then matches only
+those values, and its type narrows from `string` to the literal union:
+
+```ts
+const post = Route0.create('/:locale(ru|en)/post/:slug')
+
+post.get({ locale: 'ru', slug: 'hello' }) // '/ru/post/hello'
+post.get({ locale: 'fr', slug: 'hello' }) // ✗ type error — and throws at runtime
+
+post.getRelation('/ru/post/hello').params // { locale: 'ru', slug: 'hello' }
+post.isExact('/fr/post/hello') // false — 'fr' is not a locale
+
+type Params = typeof post.Infer.ParamsOutput
+// { locale: 'ru' | 'en'; slug: string }
+```
+
+The narrowing runs in both directions: `get()` rejects a value you didn't list,
+and parsed params come back as the union — so a `switch` over `locale` is
+exhaustive and a typo is a compile error instead of a 404 you find in
+production. `.schema` validates against the same set, and the JSON Schema it
+emits carries it as an `enum`.
+
+Add `?` after the closing parenthesis to make the param optional, exactly as
+with a plain one — which is how you get an optional locale prefix:
+
+```ts
+const routes = Routes.create({
+  home: '/:locale(ru|en)?',
+  author: '/:locale(ru|en)?/author',
+})
+
+routes._.getLocation('/author').params // { locale: undefined }
+routes._.getLocation('/ru/author').params // { locale: 'ru' }
+routes._.getLocation('/zz/author').route // undefined — a real 404
+```
+
+Without the constraint, `/zz/author` would match with `locale: 'zz'`, and any
+unknown first segment would quietly become a valid locale.
+
+Two routes whose value sets don't overlap can share a shape without becoming
+ambiguous:
+
+```ts
+Route0.create('/:locale(ru|en)/x').isConflict('/:kind(new|old)/x') // false
+Route0.create('/:locale(ru|en)/x').isConflict('/:other(en|de)/x') // true — 'en' is in both
+```
+
+### What a value may contain
+
+A value is built from URL-unreserved characters — letters, digits, `_`, `.`,
+`~`, `-`. That keeps its encoded and decoded forms identical, so a match never
+depends on how the client encoded the URL. Anything else is rejected when the
+route is created, as are duplicates and empty values:
+
+```ts
+Route0.create('/:locale(ru|en)') // fine
+Route0.create('/:locale(ru|EN)') // fine — matching is case-sensitive
+Route0.create('/:locale(ru|рус)') // ✗ throws — non-ASCII
+Route0.create('/:path(a/b)') // ✗ throws — a '/' can't live inside one segment
+Route0.create('/:locale(ru|ru)') // ✗ throws — duplicate value
+```
+
+Rejection happens at creation, with a message naming the grammar. A malformed
+param never degrades into a literal path segment that silently matches nothing.
+
+A param may list at most **32 values**. The cap exists because the union is
+built in the type system: somewhere past fifty alternatives TypeScript gives up
+with an "excessively deep" error at the call site, which tells you nothing about
+what went wrong. The cap turns that into a clear message instead. If you need a
+larger set, use a plain param and check the value yourself.
+
 ## Search params and hash
 
 Pass search params under the `?` key and a fragment under `#`. Arrays and deeply
@@ -228,10 +301,19 @@ read it through `typeof`. The members:
 | Member                  | What it is                                                              |
 | ----------------------- | ----------------------------------------------------------------------- |
 | `ParamsDefinition`      | Map of param name → `true` (required) / `false` (optional).             |
+| `ParamsValues`          | Map of param name → its value domain: a literal union, or `string`.     |
 | `ParamsInput`           | What `get()` accepts — required as `string \| number`, optional opt-in. |
 | `ParamsInputStringOnly` | Same as `ParamsInput`, but strings only (no `number`).                  |
 | `ParamsOutput`          | Parsed params — required `string`, optional `string \| undefined`.      |
 | `SearchInput`           | The route's typed search params (set via `.search<…>()`).               |
+
+For a param restricted to a set of values, `string` above is that param's
+literal union instead — and `ParamsInput` drops `number`, since a number could
+never be one of the listed values.
+
+Each member also exists as a standalone type — `ParamsOutput<typeof route>`,
+`ParamsValues<'/:locale(ru|en)?'>`, and so on — taking either a route or a
+pattern string.
 
 ## Parse any URL
 
@@ -394,6 +476,15 @@ Route0.create('/users/:id/posts/:slug?').getTokens()
 //   { kind: 'param', name: 'slug', optional: true },
 // ]
 Route0.create('/org/:org/users/:id').getParamsKeys() // ['org', 'id']
+
+// A restricted param carries its values on the token, and in getParamsValues()
+Route0.create('/:locale(ru|en)?/author').getTokens()
+// [
+//   { kind: 'param', name: 'locale', optional: true, values: ['ru', 'en'] },
+//   { kind: 'static', value: 'author' },
+// ]
+Route0.create('/:locale(ru|en)?/post/:slug').getParamsValues() // { locale: ['ru', 'en'] }
+// unrestricted params have no entry at all, and no `values` on their token
 
 // Normalize "route or string" inputs — returns the same instance if already a route
 Route0.from('/users/:id') // a callable route

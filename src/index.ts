@@ -3,12 +3,41 @@ import { parse as parseSearchQuery, stringify as stringifySearchQuery } from '@1
 
 export type RouteToken =
   | { kind: 'static'; value: string }
-  | { kind: 'param'; name: string; optional: boolean }
+  | { kind: 'param'; name: string; optional: boolean; values?: readonly string[] }
   | { kind: 'wildcard'; prefix: string; optional: boolean }
+
+/** A token that consumes exactly one path segment — everything a wildcard is not. */
+type _SegmentToken = Exclude<RouteToken, { kind: 'wildcard' }>
 
 const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
 const collapseDuplicateSlashes = (value: string): string => value.replace(/\/{2,}/g, '/')
+
+/**
+ * The one and only param-segment grammar.
+ *
+ * `:name` · `:name?` · `:name(a|b)` · `:name(a|b)?`
+ *
+ * Constraint alternatives are URL-unreserved literals (`[A-Za-z0-9_.~-]`) so that the encoded and decoded forms of a
+ * value are identical — the match regex runs against the still-encoded pathname, while `getRelation` decodes only
+ * afterwards. No regex metacharacters, no `/` (segments are split on it), no `*` (would confuse the wildcard branch).
+ */
+const PARAM_SEGMENT_REGEX = /^:([A-Za-z0-9_]+)(?:\(([A-Za-z0-9_.~-]+(?:\|[A-Za-z0-9_.~-]+)*)\))?(\?)?$/
+
+type ParsedParamSegment = { name: string; values: string[] | undefined; optional: boolean }
+
+/** Parses one path segment as a param. Returns `undefined` for anything that is not a param segment. */
+const parseParamSegment = (segment: string): ParsedParamSegment | undefined => {
+  const match = segment.match(PARAM_SEGMENT_REGEX)
+  if (!match) return undefined
+  // cast: an unmatched optional group is undefined at runtime, which `noUncheckedIndexedAccess: false` hides
+  const alternatives = match[2] as string | undefined
+  return { name: match[1], values: alternatives?.split('|'), optional: match[3] === '?' }
+}
+
+/** Regex body matching exactly the values a param accepts. Always non-capturing — see `captureKeys`. */
+const paramRegexBody = (values: readonly string[] | undefined): string =>
+  values === undefined ? '[^/]+' : `(?:${values.map(escapeRegex).join('|')})`
 
 /**
  * Strongly typed route descriptor and URL builder.
@@ -28,8 +57,8 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
   private _callable: CallableRoute<TDefinition, TSearchInput>
   private _routeSegments?: string[]
   private _routeTokens?: RouteToken[]
-  private _routePatternCandidates?: string[]
   private _pathParamsDefinition?: Record<string, boolean>
+  private _paramsValuesDefinition?: Map<string, readonly string[]>
   private _definitionWithoutTrailingWildcard?: string
   private _routeRegexBaseStringRaw?: string
   private _regexBaseString?: string
@@ -61,39 +90,226 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
     return definition.split('/').filter(Boolean)
   }
 
-  /** Ranks a single path part by specificity: static > required param > optional param > wildcard. */
+  /**
+   * Rank of a segment the shorter route does not have at all.
+   *
+   * Sits above everything that can match nothing (wildcard, optional param) _and_ above a plain required param, but
+   * below a constrained param and a static segment.
+   *
+   * The line falls there because a longer route earns a URL from its own prefix only when its extra segment names a
+   * _finite, known_ set of values: `/:locale?/author` takes `/author` from `/:locale?`, and `/:l?/:kind(new|top)` takes
+   * `/new`, because every value they do not name still belongs to the prefix. A generic `:param` tail names nothing, so
+   * ranking it above absence would let `/x/:p?/:q` swallow `/x/v` from `/x/:p?`.
+   *
+   * Note the two languages there are _not_ disjoint: skipping the shared optional segment realigns the demanded one to
+   * the left, so both routes match `/x/v`. That is why absence cannot simply be read as "exactly i segments".
+   */
+  private static readonly _RANK_ABSENT = 4
+
+  /** Upper bound on constraint alternatives, kept below the TypeScript instantiation ceiling (see the throw site). */
+  private static readonly _MAX_CONSTRAINT_VALUES = 32
+
+  /**
+   * Ranks a single path part by specificity, narrowest first:
+   *
+   * static (6) > constrained required param (5) > _absent_ (4) > required param (3) > constrained optional param (2) >
+   * optional param (1) > wildcard (0).
+   *
+   * Among real segments optionality stays dominant and constrainedness only breaks ties within a tier, so no
+   * pre-existing pair is reordered. Absence (see `_RANK_ABSENT`) is the one rank that splits the required tier.
+   */
   private static _partRank(part: string): number {
-    if (part.includes('*')) return -1
-    if (part.startsWith(':') && part.endsWith('?')) return 0
-    if (part.startsWith(':')) return 1
-    return 2
+    if (part.includes('*')) return 0
+    const param = parseParamSegment(part)
+    if (param) {
+      if (param.optional) return param.values ? 2 : 1
+      return param.values ? 5 : 3
+    }
+    return 6
   }
 
   /**
    * Total, transitive specificity order. Negative ⇒ `a` is more specific (sorts first).
    *
-   * Compares segment ranks left-to-right (static > required param > optional param > wildcard). A shorter route that is
-   * a prefix of a longer one is treated as more specific (its missing segments rank above any real segment), so exact
-   * static routes win over deeper optional/param tails. Fully equal structures fall back to the definition string so
-   * the order is deterministic regardless of insertion order — critical because the matcher relies on it to pick the
-   * right page.
+   * Compares segment ranks left-to-right (see `_partRank`). A shorter route that is a prefix of a longer one loses only
+   * where the longer route's extra segment names a finite set of values — a static segment or a constrained param. So
+   * `/:locale?/author` beats `/:locale?`, while `/users` still beats both `/users/:id?` and `/users/:id`. Fully equal
+   * structures fall back to the definition string so the order is deterministic regardless of insertion order —
+   * critical because the matcher relies on it to pick the right page.
    */
   private static _compareSpecificity(aDefinition: string, bDefinition: string): number {
     const aParts = Route0._specificityParts(aDefinition)
     const bParts = Route0._specificityParts(bDefinition)
     const length = Math.max(aParts.length, bParts.length)
     for (let i = 0; i < length; i++) {
-      // a missing segment ranks above any real one => the shorter (more exact) route sorts first
-      const aRank = i < aParts.length ? Route0._partRank(aParts[i]) : Number.POSITIVE_INFINITY
-      const bRank = i < bParts.length ? Route0._partRank(bParts[i]) : Number.POSITIVE_INFINITY
+      // a missing segment outranks anything that may match nothing and any generic param, and loses only to a
+      // segment naming a finite value set (static, constrained param)
+      const aRank = i < aParts.length ? Route0._partRank(aParts[i]) : Route0._RANK_ABSENT
+      const bRank = i < bParts.length ? Route0._partRank(bParts[i]) : Route0._RANK_ABSENT
       if (aRank !== bRank) return bRank - aRank
     }
     return aDefinition < bDefinition ? -1 : aDefinition > bDefinition ? 1 : 0
   }
 
+  /**
+   * True when a token can match the empty segment sequence, i.e. the route is still satisfiable without it.
+   *
+   * Mirrors `routeRegexBaseStringRaw`, which is the authority: a bare wildcard compiles to `(?:/(.*))?` and is
+   * skippable whether or not it is written `*?`, while a prefixed one compiles to `/prefix(.*)` and always demands at
+   * least `/prefix`.
+   */
+  private static _tokenCanMatchNothing(token: RouteToken): boolean {
+    if (token.kind === 'param') return token.optional
+    if (token.kind === 'wildcard') return token.prefix.length === 0
+    return false
+  }
+
+  private static _tailCanMatchNothing(tokens: RouteToken[], from: number): boolean {
+    for (let i = from; i < tokens.length; i++) {
+      if (!Route0._tokenCanMatchNothing(tokens[i])) return false
+    }
+    return true
+  }
+
+  /**
+   * True when two segment matchers accept a common segment.
+   *
+   * An unconstrained param accepts any non-empty slash-free segment, which every static value and every constraint
+   * value is by construction — so it intersects everything. Two value sets intersect only if they share a member.
+   */
+  private static _segmentsIntersect(a: _SegmentToken, b: _SegmentToken): boolean {
+    const aValues = a.kind === 'static' ? [a.value] : a.values
+    const bValues = b.kind === 'static' ? [b.value] : b.values
+    if (aValues === undefined || bValues === undefined) return true
+    return aValues.some((value) => bValues.includes(value))
+  }
+
+  /** True when a segment matcher accepts some segment starting with `prefix` (the head a prefixed wildcard demands). */
+  private static _acceptsSegmentStartingWith(token: _SegmentToken, prefix: string): boolean {
+    if (token.kind === 'static') return token.value.startsWith(prefix)
+    // an unconstrained param accepts `prefix` itself — a wildcard prefix is non-empty and slash-free
+    if (token.values === undefined) return true
+    return token.values.some((value) => value.startsWith(prefix))
+  }
+
+  /** True when `tokens` from `from` can produce a non-empty tail whose first segment starts with `prefix`. */
+  private static _tailCanStartWith(tokens: RouteToken[], from: number, prefix: string): boolean {
+    for (let i = from; i < tokens.length; i++) {
+      const token = tokens[i]
+      // a wildcard owns the whole tail: bare accepts anything, prefixed needs the two prefixes to nest
+      if (token.kind === 'wildcard') {
+        return token.prefix.length === 0 || token.prefix.startsWith(prefix) || prefix.startsWith(token.prefix)
+      }
+      if (Route0._acceptsSegmentStartingWith(token, prefix)) return true
+      if (!Route0._tokenCanMatchNothing(token)) return false
+    }
+    // everything left is skippable, so the only tail on offer is empty — and `prefix` is non-empty
+    return false
+  }
+
+  /**
+   * True when two token sequences accept a common pathname — exactly, with no enumeration.
+   *
+   * Walks both sides in lockstep over `(i, j)` positions, memoized, so optional params (which shift the alignment) stay
+   * polynomial instead of exponential. Wildcards are always the last token — the definition validator guarantees it —
+   * so a wildcard simply owns the whole remaining tail rather than needing its own alignment.
+   *
+   * Enumerating concrete candidate paths instead would be both slower and wrong: any bound on the candidate space is a
+   * false negative waiting to happen once params carry real value sets.
+   */
+  private static _tokensOverlap(a: RouteToken[], b: RouteToken[]): boolean {
+    const memo = new Map<number, boolean>()
+    const stride = b.length + 1
+    // every recursive step advances i + j, so the memo never has to guard an in-progress state
+    const walk = (i: number, j: number): boolean => {
+      const key = i * stride + j
+      const cached = memo.get(key)
+      if (cached !== undefined) return cached
+      const result = step(i, j)
+      memo.set(key, result)
+      return result
+    }
+    const step = (i: number, j: number): boolean => {
+      const aToken = i < a.length ? a[i] : undefined
+      const bToken = j < b.length ? b[j] : undefined
+      if (aToken === undefined && bToken === undefined) return true
+      if (aToken === undefined) return Route0._tailCanMatchNothing(b, j)
+      if (bToken === undefined) return Route0._tailCanMatchNothing(a, i)
+      // Wildcards are handled one side at a time so each branch narrows its own token — a combined
+      // `a is wildcard || b is wildcard` guard tells the compiler nothing about which of the two it was.
+      if (aToken.kind === 'wildcard' && bToken.kind === 'wildcard') {
+        // the prefixes must nest; a bare wildcard has prefix '', which every prefix starts with
+        return aToken.prefix.startsWith(bToken.prefix) || bToken.prefix.startsWith(aToken.prefix)
+      }
+      // a bare wildcard matches every tail, and the other side's remaining tokens are always satisfiable;
+      // a prefixed one needs the other side to open with a segment carrying that prefix
+      if (aToken.kind === 'wildcard') {
+        return aToken.prefix.length === 0 || Route0._tailCanStartWith(b, j, aToken.prefix)
+      }
+      if (bToken.kind === 'wildcard') {
+        return bToken.prefix.length === 0 || Route0._tailCanStartWith(a, i, bToken.prefix)
+      }
+      // an optional param may be left out, which realigns the rest against the other side
+      if (aToken.kind === 'param' && aToken.optional && walk(i + 1, j)) return true
+      if (bToken.kind === 'param' && bToken.optional && walk(i, j + 1)) return true
+      return Route0._segmentsIntersect(aToken, bToken) && walk(i + 1, j + 1)
+    }
+    return walk(0, 0)
+  }
+
   private static _validateRouteDefinition(definition: string): void {
     const segments = Route0._getRouteSegments(definition)
+
+    // Param grammar. Runs before the wildcard checks so a malformed param reports the specific reason.
+    // Without this, anything unparseable silently degrades into a literal static segment that matches nothing.
+    const seenParamNames = new Set<string>()
+    for (const segment of segments) {
+      // `:prefix*` is a wildcard with a prefix, not a param — leave it to the wildcard checks below.
+      if (!segment.startsWith(':') || segment.includes('*')) continue
+      const param = parseParamSegment(segment)
+      if (!param) {
+        // An unbalanced "(" is worth calling out: the quoted segment is then only the head of what the author wrote,
+        // because a "/" inside a constraint splits it before this check ever sees it.
+        const unbalanced = segment.includes('(') && !segment.includes(')')
+        throw new Error(
+          `Invalid route definition "${definition}": malformed param segment "${segment}". Expected ":name", ` +
+            `":name?", ":name(a|b)" or ":name(a|b)?" — the name is [A-Za-z0-9_]+ and each allowed value is ` +
+            `[A-Za-z0-9_.~-]+.` +
+            (unbalanced
+              ? ' The "(" is never closed: either the ")" is missing, or the constraint contained a "/", which' +
+                ' splits the segment before it reaches this check.'
+              : ''),
+        )
+      }
+      if (param.values) {
+        // Measured on TS 6.0.3 and 7.0.2: 46 alternatives still check, 48 blow the instantiation budget with a
+        // cryptic TS2589 at the call site. Cap well below that so the author gets this message instead.
+        if (param.values.length > Route0._MAX_CONSTRAINT_VALUES) {
+          throw new Error(
+            `Invalid route definition "${definition}": "${segment}" has ${param.values.length} allowed values, ` +
+              `the maximum is ${Route0._MAX_CONSTRAINT_VALUES}`,
+          )
+        }
+        const seenValues = new Set<string>()
+        for (const value of param.values) {
+          if (seenValues.has(value)) {
+            throw new Error(
+              `Invalid route definition "${definition}": duplicate constraint value "${value}" in "${segment}"`,
+            )
+          }
+          seenValues.add(value)
+        }
+      }
+      if (seenParamNames.has(param.name)) {
+        throw new Error(`Invalid route definition "${definition}": duplicate param name "${param.name}"`)
+      }
+      seenParamNames.add(param.name)
+    }
+
     const wildcardSegments = segments.filter((segment) => segment.includes('*'))
+    if (wildcardSegments.some((segment) => segment.includes('('))) {
+      throw new Error(`Invalid route definition "${definition}": a wildcard cannot carry a value constraint`)
+    }
     if (wildcardSegments.length === 0) return
     if (wildcardSegments.length > 1) {
       throw new Error(`Invalid route definition "${definition}": only one wildcard segment is allowed`)
@@ -110,6 +326,7 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
 
   Infer: {
     ParamsDefinition: _ParamsDefinition<TDefinition>
+    ParamsValues: _ParamsValues<TDefinition>
     ParamsInput: _ParamsInput<TDefinition>
     ParamsInputStringOnly: _ParamsInputStringOnly<TDefinition>
     ParamsOutput: ParamsOutput<TDefinition>
@@ -268,16 +485,38 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
 
     // create url
 
-    let url = this.definition as string
-    // optional named params like /:id?
-    url = url.replace(/\/:([A-Za-z0-9_]+)\?/g, (_m, k) => {
-      const value = paramsInput[k]
-      if (value === undefined) return ''
-      return `/${enc(String(value))}`
-    })
-    // required named params
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-    url = url.replace(/:([A-Za-z0-9_]+)(?!\?)/g, (_m, k) => enc(String(paramsInput?.[k] ?? 'undefined')))
+    // Params are substituted segment-wise off the shared grammar rather than by regex surgery on the definition, so a
+    // constraint can never leak into the produced URL and the value can be checked against its allowed set.
+    const outSegments: string[] = []
+    for (const segment of (this.definition as string).split('/')) {
+      const param = segment.includes('*') ? undefined : parseParamSegment(segment)
+      if (!param) {
+        outSegments.push(segment)
+        continue
+      }
+      const value = paramsInput[param.name]
+      if (value === undefined) {
+        if (param.optional) continue
+        // A missing required param keeps the legacy literal "undefined" — except when constrained, where we know for
+        // certain the result could never match its own route, so failing loudly beats emitting a dead URL.
+        if (param.values) {
+          throw new Error(
+            `Invalid params for route "${this.definition}": "${param.name}" is required and must be one of ` +
+              `${param.values.map((v) => `"${v}"`).join(', ')} (received undefined)`,
+          )
+        }
+        outSegments.push(enc('undefined'))
+        continue
+      }
+      if (param.values && !param.values.includes(value)) {
+        throw new Error(
+          `Invalid params for route "${this.definition}": "${param.name}" must be one of ` +
+            `${param.values.map((v) => `"${v}"`).join(', ')} (received "${value}")`,
+        )
+      }
+      outSegments.push(enc(value))
+    }
+    let url = outSegments.join('/')
     // optional wildcard segment (/*?)
     url = url.replace(/\/\*\?/g, () => {
       const value = paramsInput['*']
@@ -316,8 +555,27 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
     return Object.keys(this.params)
   }
 
+  /**
+   * Allowed values per constrained param, e.g. `/:locale(ru|en)?` ⇒ `{ locale: ['ru', 'en'] }`.
+   *
+   * Unconstrained params are absent, at the type level as well as at runtime. Exposed as a method rather than a field
+   * so the runtime shape (name ⇒ values) is free to differ from the type-level one (name ⇒ union) — `params` keeps
+   * meaning "is this param required".
+   */
+  getParamsValues(): _ParamsAllowedValues<TDefinition> {
+    const values: Record<string, readonly string[]> = Object.fromEntries(
+      Array.from(this.paramsValuesDefinition, ([key, allowed]) => [key, [...allowed]]),
+    )
+    return values as _ParamsAllowedValues<TDefinition>
+  }
+
   getTokens(): RouteToken[] {
-    return this.routeTokens.map((token): RouteToken => ({ ...token }))
+    // `values` is the only non-primitive on a token, so the spread alone would hand out the array the matcher
+    // itself reads — mutating it would silently widen what the route matches. Copy it, like `getParamsValues`.
+    return this.routeTokens.map(
+      (token): RouteToken =>
+        token.kind === 'param' && token.values ? { ...token, values: [...token.values] } : { ...token },
+    )
   }
 
   /** Clones route with optional config override. */
@@ -364,19 +622,19 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
   private get regexDescendantMatchers(): Array<{ regex: RegExp; captureKeys: string[] }> {
     if (this._regexDescendantMatchers === undefined) {
       const matchers: Array<{ regex: RegExp; captureKeys: string[] }> = []
-      if (this.definitionParts[0] !== '/') {
+      if (this.routeTokens.length > 0) {
         let pattern = ''
         const captureKeys: string[] = []
-        for (const part of this.definitionParts) {
-          if (part.startsWith(':')) {
-            pattern += '/([^/]+)'
-            captureKeys.push(part.replace(/^:/, '').replace(/\?$/, ''))
-          } else if (part.includes('*')) {
-            const prefix = part.replace(/\*\??$/, '')
-            pattern += `/${escapeRegex(prefix)}[^/]*`
+        // Driven off tokens (not raw definition parts) so param names and value constraints agree with `regex`.
+        for (const token of this.routeTokens) {
+          if (token.kind === 'param') {
+            pattern += `/(${paramRegexBody(token.values)})`
+            captureKeys.push(token.name)
+          } else if (token.kind === 'wildcard') {
+            pattern += `/${escapeRegex(token.prefix)}[^/]*`
             captureKeys.push('*')
           } else {
-            pattern += `/${escapeRegex(part)}`
+            pattern += `/${escapeRegex(token.value)}`
           }
           matchers.push({
             regex: new RegExp(`^${pattern}/?$`),
@@ -408,9 +666,12 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
   private get routeTokens(): RouteToken[] {
     if (this._routeTokens === undefined) {
       this._routeTokens = this.routeSegments.map((segment): RouteToken => {
-        const param = segment.match(/^:([A-Za-z0-9_]+)(\?)?$/)
+        const param = parseParamSegment(segment)
         if (param) {
-          return { kind: 'param', name: param[1], optional: param[2] === '?' }
+          // `values` stays absent (not `undefined`/`null`) for an unconstrained param so `getTokens()` keeps its shape
+          return param.values
+            ? { kind: 'param', name: param.name, optional: param.optional, values: param.values }
+            : { kind: 'param', name: param.name, optional: param.optional }
         }
         if (segment === '*' || segment === '*?') {
           return { kind: 'wildcard', prefix: '', optional: segment.endsWith('?') }
@@ -425,38 +686,6 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
     return this._routeTokens
   }
 
-  private get routePatternCandidates(): string[] {
-    if (this._routePatternCandidates === undefined) {
-      const values = (token: RouteToken): string[] => {
-        if (token.kind === 'static') return [token.value]
-        if (token.kind === 'param') return token.optional ? ['', 'x', 'y'] : ['x', 'y']
-        if (token.prefix.length > 0)
-          return [token.prefix, `${token.prefix}-x`, `${token.prefix}/x`, `${token.prefix}/y/z`]
-        return ['', 'x', 'y', 'x/y']
-      }
-      let acc: string[] = ['']
-      for (const token of this.routeTokens) {
-        const next: string[] = []
-        for (const base of acc) {
-          for (const value of values(token)) {
-            if (value === '') {
-              next.push(base)
-            } else if (value.startsWith('/')) {
-              next.push(`${base}${value}`)
-            } else {
-              next.push(`${base}/${value}`)
-            }
-          }
-        }
-        // Keep candidate space bounded for large route definitions.
-        acc = next.length > 512 ? next.slice(0, 512) : next
-      }
-      this._routePatternCandidates =
-        acc.length === 0 ? ['/'] : Array.from(new Set(acc.map((x) => (x === '' ? '/' : collapseDuplicateSlashes(x)))))
-    }
-    return this._routePatternCandidates
-  }
-
   private get pathParamsDefinition(): Record<string, boolean> {
     if (this._pathParamsDefinition === undefined) {
       const entries = this.routeTokens
@@ -465,6 +694,18 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
       this._pathParamsDefinition = Object.fromEntries(entries)
     }
     return this._pathParamsDefinition
+  }
+
+  /** Allowed values per constrained param name. Unconstrained params are absent. */
+  private get paramsValuesDefinition(): Map<string, readonly string[]> {
+    if (this._paramsValuesDefinition === undefined) {
+      this._paramsValuesDefinition = new Map(
+        this.routeTokens
+          .filter((t): t is Extract<RouteToken, { kind: 'param' }> => t.kind === 'param' && t.values !== undefined)
+          .map((t): [string, readonly string[]] => [t.name, t.values as readonly string[]]),
+      )
+    }
+    return this._paramsValuesDefinition
   }
 
   private get definitionWithoutTrailingWildcard(): string {
@@ -486,7 +727,9 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
             continue
           }
           if (token.kind === 'param') {
-            pattern += token.optional ? '(?:/([^/]+))?' : '/([^/]+)'
+            // exactly one capture group per param — `captureKeys` maps groups to names positionally
+            const body = paramRegexBody(token.values)
+            pattern += token.optional ? `(?:/(${body}))?` : `/(${body})`
             continue
           }
           if (token.prefix.length > 0) {
@@ -804,18 +1047,34 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
       }
     }
     const data: Record<string, string | undefined> = {}
+    const paramsValues = this.paramsValuesDefinition
     for (const k of paramsKeys) {
       const v = inputObj[k]
       const required = paramsMap[k]
+      let value: string | undefined
       if (v === undefined && !required) {
-        data[k] = undefined as never
+        value = undefined
       } else if (typeof v === 'string') {
-        data[k] = v
+        value = v
       } else if (typeof v === 'number') {
-        data[k] = String(v)
+        value = String(v)
       } else {
         return {
           issues: [{ message: `Invalid route params: expected string, number, got ${typeof v} for "${k}"` }],
+        }
+      }
+      data[k] = value
+      const allowed = paramsValues.get(k)
+      if (allowed && value !== undefined && !allowed.includes(value)) {
+        return {
+          issues: [
+            {
+              message:
+                `Invalid route params: "${k}" must be one of ${allowed.map((a) => `"${a}"`).join(', ')} ` +
+                `(received "${data[k]}")`,
+              path: [k],
+            },
+          ],
         }
       }
     }
@@ -853,13 +1112,21 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
 
   private _getParamsInputJSONSchema(options: StandardJSONSchemaV1.Options): Record<string, unknown> {
     const { target } = options
+    const paramsValues = this.paramsValuesDefinition
     const properties = Object.fromEntries(
-      Object.keys(this.params).map((key): [string, Record<string, unknown>] => [
-        key,
-        {
-          anyOf: [{ type: 'string' }, { type: 'number' }],
-        },
-      ]),
+      Object.keys(this.params).map((key): [string, Record<string, unknown>] => {
+        // A constrained param only ever accepts one of its string literals, so the number branch drops out —
+        // matching the type level, where a constrained param loses `number`.
+        const allowed = paramsValues.get(key)
+        return [
+          key,
+          allowed
+            ? { type: 'string', enum: [...allowed] }
+            : {
+                anyOf: [{ type: 'string' }, { type: 'number' }],
+              },
+        ]
+      }),
     )
     const required = Object.entries(this.params)
       .filter(([, isRequired]) => isRequired)
@@ -881,13 +1148,19 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
 
   private _getParamsOutputJSONSchema(options: StandardJSONSchemaV1.Options): Record<string, unknown> {
     const { target } = options
+    const paramsValues = this.paramsValuesDefinition
     const properties = Object.fromEntries(
-      Object.keys(this.params).map((key): [string, Record<string, unknown>] => [
-        key,
-        {
-          type: 'string',
-        },
-      ]),
+      Object.keys(this.params).map((key): [string, Record<string, unknown>] => {
+        const allowed = paramsValues.get(key)
+        return [
+          key,
+          allowed
+            ? { type: 'string', enum: [...allowed] }
+            : {
+                type: 'string',
+              },
+        ]
+      }),
     )
     const required = Object.entries(this.params)
       .filter(([, isRequired]) => isRequired)
@@ -1036,13 +1309,7 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
   isOverlap(other: AnyRoute | string | undefined): boolean {
     if (!other) return false
     const otherRoute = Route0.from(other) as Route0<string, UnknownSearchInput>
-    const thisRegex = this.regex
-    const otherRegex = otherRoute.regex
-    const thisCandidates = this.routePatternCandidates
-    const otherCandidates = otherRoute.routePatternCandidates
-    if (thisCandidates.some((path) => otherRegex.test(path))) return true
-    if (otherCandidates.some((path) => thisRegex.test(path))) return true
-    return false
+    return Route0._tokensOverlap(this.routeTokens, otherRoute.routeTokens)
   }
 
   /**
@@ -1052,6 +1319,11 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
    * (e.g. `/users/impersonate/:id?` dominates `/users/:sn`, so it can simply be ordered first). A real conflict only
    * happens when specificity _crosses_ — each side wins some segment (e.g. `/:x/:id` vs `/x/:sn?`) — or when both
    * routes have equal specificity at the same depth (e.g. `/x/:id` vs `/x/:sn`).
+   *
+   * Caveat on the different-depth case: "resolvable by ordering" is right, but not because the shorter route's language
+   * is a subset. When the shared prefix ends in an optional segment the two can properly cross — `/x/:p?` and
+   * `/x/:p?/:q` share `/x/v` while each also owns URLs the other cannot match (`/x` and `/x/a/b`). Ordering still
+   * decides it deterministically, and `_RANK_ABSENT` fixes which way, so this is reported as no conflict by design.
    */
   isConflict(other: AnyRoute | string | undefined): boolean {
     if (!other) return false
@@ -1071,8 +1343,8 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
     if (thisMoreSpecific && otherMoreSpecific) return true
     // One side is uniformly more specific => strict subset => resolvable by ordering.
     if (thisMoreSpecific || otherMoreSpecific) return false
-    // Equal specificity in the shared region: only same-depth routes are real conflicts
-    // (equal "languages"); different depth means a strict subset that ordering resolves.
+    // Equal specificity in the shared region: only same-depth routes are real conflicts (equal "languages").
+    // Different depth is left to ordering — see the caveat above; it is not always a strict subset.
     return thisParts.length === otherParts.length
   }
 
@@ -1354,11 +1626,22 @@ export type HasRequiredParams<T extends AnyRoute | string> =
   _RequiredParamKeys<Definition<T>> extends never ? false : true
 
 export type ParamsOutput<T extends AnyRoute | string> = {
-  [K in keyof ParamsDefinition<T>]: ParamsDefinition<T>[K] extends true ? string : string | undefined
+  [K in keyof ParamsDefinition<T>]: ParamsDefinition<T>[K] extends true
+    ? _ParamOutputValue<_ParamValueOf<Definition<T>, K>>
+    : _ParamOutputValue<_ParamValueOf<Definition<T>, K>> | undefined
 }
 export type ParamsInput<T extends AnyRoute | string = string> = _ParamsInput<Definition<T>>
 export type IsParamsOptional<T extends AnyRoute | string> = HasRequiredParams<Definition<T>> extends true ? false : true
 export type ParamsInputStringOnly<T extends AnyRoute | string = string> = _ParamsInputStringOnly<Definition<T>>
+/**
+ * Each param's value _domain_: the literal union for a constrained param, `string` for a plain one.
+ *
+ * The counterpart to {@link ParamsDefinition} (name ⇒ is-required) on the other axis, and the public form of
+ * `route.Infer.ParamsValues`.
+ */
+export type ParamsValues<T extends AnyRoute | string = string> = _ParamsValues<Definition<T>>
+/** Return type of `route.getParamsValues()`: allowed values per constrained param, plain params absent. */
+export type ParamsAllowedValues<T extends AnyRoute | string = string> = _ParamsAllowedValues<Definition<T>>
 
 // relation
 
@@ -1405,12 +1688,6 @@ export type RouteRelation<TRoute extends AnyRoute | string = AnyRoute | string> 
   | UnmatchedRouteRelation<TRoute>
 
 // location
-
-export type LocationParams<TDefinition extends string> = {
-  [K in keyof _ParamsDefinition<TDefinition>]: _ParamsDefinition<TDefinition>[K] extends true
-    ? string
-    : string | undefined
-}
 
 /**
  * URL location primitives independent from route-matching state.
@@ -1569,9 +1846,11 @@ export type _ParamsInput<TDefinition extends string> =
         Record<never, never>,
         _Simplify<
           {
-            [K in keyof TDef as TDef[K] extends true ? K : never]: string | number
+            [K in keyof TDef as TDef[K] extends true ? K : never]: _ParamInputValue<_ParamValueOf<TDefinition, K>>
           } & {
-            [K in keyof TDef as TDef[K] extends false ? K : never]?: string | number | undefined
+            [K in keyof TDef as TDef[K] extends false ? K : never]?:
+              | _ParamInputValue<_ParamValueOf<TDefinition, K>>
+              | undefined
           }
         >
       >
@@ -1584,9 +1863,11 @@ export type _ParamsInputStringOnly<TDefinition extends string> =
         Record<never, never>,
         _Simplify<
           {
-            [K in keyof TDef as TDef[K] extends true ? K : never]: string
+            [K in keyof TDef as TDef[K] extends true ? K : never]: _ParamOutputValue<_ParamValueOf<TDefinition, K>>
           } & {
-            [K in keyof TDef as TDef[K] extends false ? K : never]?: string | undefined
+            [K in keyof TDef as TDef[K] extends false ? K : never]?:
+              | _ParamOutputValue<_ParamValueOf<TDefinition, K>>
+              | undefined
           }
         >
       >
@@ -1606,15 +1887,101 @@ export type _SplitPathSegments<TPath extends string> = TPath extends ''
           ? []
           : [TPath]
 
-export type _ParamDefinitionFromSegment<TSegment extends string> = TSegment extends `:${infer Name}?`
-  ? { [K in Name]: false }
-  : TSegment extends `:${infer Name}`
-    ? { [K in Name]: true }
-    : TSegment extends `${string}*?`
-      ? { '*': false }
-      : TSegment extends `${string}*`
-        ? { '*': true }
-        : Record<never, never>
+/**
+ * Branch order is load-bearing twice over.
+ *
+ * The wildcard branches come first because `:prefix*` is a wildcard carrying a prefix, not a param — the runtime has
+ * always read it that way, while `:${infer Name}` used to claim it and mint a phantom key `'id*'`. Only a segment that
+ * both starts with `:` and ends with `*` is affected; the param grammar rejects `*` everywhere else.
+ *
+ * The constrained branches then precede the plain ones: `:${infer Name}?` would otherwise swallow ':locale(ru|en)?'
+ * with Name = 'locale(ru|en)' — the garbage key this grammar exists to remove.
+ */
+export type _ParamDefinitionFromSegment<TSegment extends string> = TSegment extends `${string}*?`
+  ? { '*': false }
+  : TSegment extends `${string}*`
+    ? { '*': true }
+    : TSegment extends `:${infer Name}(${string})?`
+      ? { [K in Name]: false }
+      : TSegment extends `:${infer Name}(${string})`
+        ? { [K in Name]: true }
+        : TSegment extends `:${infer Name}?`
+          ? { [K in Name]: false }
+          : TSegment extends `:${infer Name}`
+            ? { [K in Name]: true }
+            : Record<never, never>
+
+/** `'ru|en'` ⇒ `'ru' | 'en'`. Recurses once per alternative. */
+export type _SplitAlternatives<S extends string> = S extends `${infer Head}|${infer Rest}`
+  ? Head | _SplitAlternatives<Rest>
+  : S
+
+/**
+ * The value domain of a segment's param: a literal union when constrained, `string` otherwise.
+ *
+ * Deliberately parallel to `_ParamDefinitionFromSegment` rather than merged into it — `_ParamsDefinition` is also the
+ * runtime type of the public `params` field, and widening its values from `boolean` would break `params`,
+ * `ParamsDefinition`, `Infer.ParamsDefinition` and both JSON-schema emitters.
+ */
+export type _ParamValuesFromSegment<TSegment extends string> = TSegment extends `${string}*?`
+  ? { '*': string }
+  : TSegment extends `${string}*`
+    ? { '*': string }
+    : TSegment extends `:${infer Name}(${infer V})?`
+      ? { [K in Name]: _SplitAlternatives<V> }
+      : TSegment extends `:${infer Name}(${infer V})`
+        ? { [K in Name]: _SplitAlternatives<V> }
+        : TSegment extends `:${infer Name}?`
+          ? { [K in Name]: string }
+          : TSegment extends `:${infer Name}`
+            ? { [K in Name]: string }
+            : Record<never, never>
+
+export type _MergeParamValues<A extends Record<string, string>, B extends Record<string, string>> = {
+  [K in keyof A | keyof B]: K extends keyof B ? B[K] : K extends keyof A ? A[K] : never
+}
+
+export type _ExtractParamsValuesBySegments<TSegments extends string[]> = TSegments extends [
+  infer Segment extends string,
+  ...infer Rest extends string[],
+]
+  ? _MergeParamValues<_ParamValuesFromSegment<Segment>, _ExtractParamsValuesBySegments<Rest>>
+  : Record<never, never>
+
+export type _ParamsValues<TDefinition extends string> = _ExtractParamsValuesBySegments<
+  _SplitPathSegments<Definition<TDefinition>>
+>
+
+/**
+ * Looks up one param's value domain.
+ *
+ * Two guards, both load-bearing: the outer one falls back to `string` when the key is absent, so a definition the
+ * segment parser reads differently degrades instead of collapsing to `never`; the inner one re-proves `extends string`,
+ * which TypeScript cannot see through the deferred `_ParamsValues` for a generic `TDefinition` — without it every
+ * consumer that constrains `V extends string` (`_ParamInputValue`, `_ParamOutputValue`) fails to instantiate.
+ */
+export type _ParamValueOf<
+  TDefinition extends string,
+  K extends PropertyKey,
+> = K extends keyof _ParamsValues<TDefinition>
+  ? _ParamsValues<TDefinition>[K] extends string
+    ? _ParamsValues<TDefinition>[K]
+    : string
+  : string
+
+/** Params that carry a value constraint — i.e. whose domain is narrower than `string`. */
+export type _ConstrainedParamKeys<TDefinition extends string> = {
+  [K in keyof _ParamsValues<TDefinition>]: string extends _ParamsValues<TDefinition>[K] ? never : K
+}[keyof _ParamsValues<TDefinition>]
+
+/** Allowed values per constrained param. Plain params are absent, mirroring the runtime map. */
+export type _ParamsAllowedValues<TDefinition extends string> = {
+  [K in _ConstrainedParamKeys<TDefinition>]: ReadonlyArray<_ParamValueOf<TDefinition, K>>
+}
+
+// `string extends V` is the "unconstrained" test; note V sits on the RIGHT of `extends`, so these do not distribute.
+export type _ParamInputValue<V extends string> = string extends V ? string | number : V
+export type _ParamOutputValue<V extends string> = string extends V ? string : V
 
 export type _MergeParamDefinitions<A extends Record<string, boolean>, B extends Record<string, boolean>> = {
   [K in keyof A | keyof B]: K extends keyof B ? B[K] : K extends keyof A ? A[K] : never
