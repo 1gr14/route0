@@ -5,6 +5,8 @@ work; `bun run release` promotes that section to the new version.
 
 ## Unreleased
 
+## 0.3.0 — 2026-07-20
+
 - Breaking: `route.params` maps a param name to a descriptor —
   `{ required, type: 'string' }`, or `{ required, type: 'enum', values }` for a
   param restricted to a set. `ParamsDefinition<T>` answers both questions about a
