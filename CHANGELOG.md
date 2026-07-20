@@ -5,6 +5,26 @@ work; `bun run release` promotes that section to the new version.
 
 ## Unreleased
 
+- Breaking: `route.params` maps a param name to a descriptor —
+  `{ required, type: 'string' }`, or `{ required, type: 'enum', values }` for a
+  param restricted to a set. `ParamsDefinition<T>` answers both questions about a
+  param: `Def['locale']['required']`, `Def['locale']['values']`. `type` is the
+  param's base type, so a future `{ type: 'number' }` joins as one more member.
+- Breaking: `route.getParamsValues()`, `Infer.ParamsValues` and the standalone
+  `ParamsValues` / `ParamsAllowedValues` helpers are gone; the descriptor covers
+  them. Use `route.params.<name>.values` at runtime,
+  `ParamsDefinition<T>['<name>']['values']` at the type level.
+- Breaking: `IsSameParams` compares value constraints, so two params with the
+  same name but different allowed values are not the same. Listing one set in
+  another order still compares equal — it is a union, not a sequence.
+- Breaking: `route.params` and `getTokens()` are frozen, and `getTokens()` is
+  typed `readonly RouteToken[]`. They share the `values` array the matcher reads,
+  so mutating it would widen what `.schema` accepts without widening what `regex`
+  matches. Reading is unaffected.
+- Fix: a route that consumes no path segments keeps its leading slash when a
+  search string is appended — `Route0.create('/:a?/:b?').get({ '?': { x: 1 } })`
+  builds `/?x=1`.
+
 ## 0.2.0 — 2026-07-20
 
 - Feature: params can be restricted to a set of values — `:name(a|b)` and

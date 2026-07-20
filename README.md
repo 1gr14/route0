@@ -78,7 +78,7 @@ const route = Route0.create('/org/:org/users/:id')
 route({ org: 'acme', id: 42 }) // '/org/acme/users/42'  — callable form
 route.get({ org: 'acme', id: 42 }) // same thing
 route.definition // '/org/:org/users/:id'  — the pattern back out
-route.params // { org: true, id: true }  — param name → required?
+route.params // { org: { required: true, type: 'string' }, id: { required: true, type: 'string' } }
 ```
 
 ## Optional and wildcard params
@@ -300,8 +300,7 @@ read it through `typeof`. The members:
 
 | Member                  | What it is                                                              |
 | ----------------------- | ----------------------------------------------------------------------- |
-| `ParamsDefinition`      | Map of param name → `true` (required) / `false` (optional).             |
-| `ParamsValues`          | Map of param name → its value domain: a literal union, or `string`.     |
+| `ParamsDefinition`      | Map of param name → its descriptor (see `params` above).                |
 | `ParamsInput`           | What `get()` accepts — required as `string \| number`, optional opt-in. |
 | `ParamsInputStringOnly` | Same as `ParamsInput`, but strings only (no `number`).                  |
 | `ParamsOutput`          | Parsed params — required `string`, optional `string \| undefined`.      |
@@ -312,8 +311,9 @@ literal union instead — and `ParamsInput` drops `number`, since a number could
 never be one of the listed values.
 
 Each member also exists as a standalone type — `ParamsOutput<typeof route>`,
-`ParamsValues<'/:locale(ru|en)?'>`, and so on — taking either a route or a
-pattern string.
+`ParamsDefinition<'/:locale(ru|en)?'>`, and so on — taking either a route or a
+pattern string. A single param reads straight off the descriptor:
+`ParamsDefinition<typeof route>['locale']['required']`.
 
 ## Parse any URL
 
@@ -477,14 +477,16 @@ Route0.create('/users/:id/posts/:slug?').getTokens()
 // ]
 Route0.create('/org/:org/users/:id').getParamsKeys() // ['org', 'id']
 
-// A restricted param carries its values on the token, and in getParamsValues()
+// A restricted param carries its values on the token, and on its descriptor
 Route0.create('/:locale(ru|en)?/author').getTokens()
 // [
 //   { kind: 'param', name: 'locale', optional: true, values: ['ru', 'en'] },
 //   { kind: 'static', value: 'author' },
 // ]
-Route0.create('/:locale(ru|en)?/post/:slug').getParamsValues() // { locale: ['ru', 'en'] }
-// unrestricted params have no entry at all, and no `values` on their token
+Route0.create('/:locale(ru|en)?/post/:slug').params.locale
+// { required: false, type: 'enum', values: ['ru', 'en'] }
+// an unrestricted param is `{ required, type: 'string' }` — no `values` key, and none on its token
+// tokens and descriptors are frozen: mutating them would widen the schema without widening the matcher
 
 // Normalize "route or string" inputs — returns the same instance if already a route
 Route0.from('/users/:id') // a callable route

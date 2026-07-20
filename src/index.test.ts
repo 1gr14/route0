@@ -17,12 +17,11 @@ import type {
   IsParamsOptional,
   IsSameParams,
   KnownLocation,
-  ParamsAllowedValues,
   ParamsDefinition,
   ParamsInput,
   ParamsInputStringOnly,
   ParamsOutput,
-  ParamsValues,
+  RouteToken,
   RoutesPretty,
   UnknownLocation,
   UnknownSearchInput,
@@ -70,6 +69,17 @@ describe('Route0', () => {
     expect(route0({ '?': { q: '1' } })).toBe(path)
     expect(route0({ '?': { q: '1' }, '#': 'zxc' })).toBe(pathHash)
     expectTypeOf<(typeof route0)['Infer']['SearchInput']>().toEqualTypeOf<UnknownSearchInput>()
+  })
+
+  it('keeps the leading slash when the path consumes no segments', () => {
+    // An all-optional route with nothing supplied is the root, and stays the root once a search string is appended.
+    expect(Route0.create('/:a?/:b?').get({ '?': { x: '1' } })).toBe('/?x=1')
+    expect(Route0.create('/:a?/:b?').get({})).toBe('/')
+    expect(Route0.create('/:a?/:b?').get({ a: 'A', '?': { x: '1' } })).toBe('/A?x=1')
+    expect(Route0.create('/*?').get({ '?': { x: '1' } })).toBe('/?x=1')
+    expect(Route0.create('/*?').get({ '*': 'w', '?': { x: '1' } })).toBe('/w?x=1')
+    expect(Route0.create('/:a?').get({ '?': { x: '1' }, '#': 'h' })).toBe('/?x=1#h')
+    expect(Route0.create('/:a?').get({ '#': 'h' })).toBe('/#h')
   })
 
   it('search deep object and array', () => {
@@ -180,7 +190,10 @@ describe('Route0', () => {
     const route0 = Route0.create('/prefix/:x?/:y')
     expect(route0.get({ y: '2' })).toBe('/prefix/2')
     expect(route0.get({ x: '1', y: '2' })).toBe('/prefix/1/2')
-    expectTypeOf<(typeof route0)['Infer']['ParamsDefinition']>().toEqualTypeOf<{ x: false; y: true }>()
+    expectTypeOf<(typeof route0)['Infer']['ParamsDefinition']>().toEqualTypeOf<{
+      x: { required: false; type: 'string' }
+      y: { required: true; type: 'string' }
+    }>()
     expectTypeOf<(typeof route0)['Infer']['ParamsInput']>().toEqualTypeOf<{
       y: string | number
       x?: string | number | undefined
@@ -206,8 +219,12 @@ describe('Route0', () => {
     expect(routeOptionalWildcard.getRelation('/orders/completed/list').params).toStrictEqual({
       '*': 'completed/list',
     })
-    expectTypeOf<(typeof routeWildcard)['Infer']['ParamsDefinition']>().toEqualTypeOf<{ '*': true }>()
-    expectTypeOf<(typeof routeOptionalWildcard)['Infer']['ParamsDefinition']>().toEqualTypeOf<{ '*': false }>()
+    expectTypeOf<(typeof routeWildcard)['Infer']['ParamsDefinition']>().toEqualTypeOf<{
+      '*': { required: true; type: 'string' }
+    }>()
+    expectTypeOf<(typeof routeOptionalWildcard)['Infer']['ParamsDefinition']>().toEqualTypeOf<{
+      '*': { required: false; type: 'string' }
+    }>()
     expectTypeOf<(typeof routeWildcard)['Infer']['ParamsOutput']>().toEqualTypeOf<{ '*': string }>()
     expectTypeOf<(typeof routeOptionalWildcard)['Infer']['ParamsOutput']>().toEqualTypeOf<{ '*': string | undefined }>()
   })
@@ -440,7 +457,8 @@ describe('Route0', () => {
       { kind: 'param', name: 'id', optional: false },
       { kind: 'static', value: 'posts' },
     ])
-    tokens[0] = { kind: 'static', value: 'mutated' }
+    // frozen rather than copied per call — see the freeze tests under "param constraints: grammar and tokens"
+    expect(() => ((tokens as RouteToken[])[0] = { kind: 'static', value: 'mutated' })).toThrow()
     expect(route.getTokens()[0]).toEqual({ kind: 'static', value: 'users' })
   })
 
@@ -1032,6 +1050,16 @@ describe('type utilities', () => {
     expectTypeOf<T2>().toEqualTypeOf<true>()
     expectTypeOf<T3>().toEqualTypeOf<false>()
     expectTypeOf<T4>().toEqualTypeOf<false>()
+  })
+
+  it('IsSameParams sees a value constraint', () => {
+    // Params carry their allowed values, so two same-named params with different domains are not the same.
+    expectTypeOf<IsSameParams<'/x/:a(v|w)', '/y/:a'>>().toEqualTypeOf<false>()
+    expectTypeOf<IsSameParams<'/x/:a(v)', '/y/:a(v|w)'>>().toEqualTypeOf<false>()
+    // the set is a union, so listing it in another order is the same set
+    expectTypeOf<IsSameParams<'/x/:a(v|w)', '/y/:a(w|v)'>>().toEqualTypeOf<true>()
+    // required-ness counts too
+    expectTypeOf<IsSameParams<'/x/:a(v|w)', '/y/:a(v|w)?'>>().toEqualTypeOf<false>()
   })
 
   it('Extended', () => {
@@ -3098,7 +3126,10 @@ describe('Infer', () => {
     const route = Route0.create('/users/:id/:tab?').search<{ ref?: string }>()
     expect(route.get({ id: 1, '?': { ref: 'x' } })).toBe('/users/1?ref=x')
 
-    expectTypeOf<typeof route.Infer.ParamsDefinition>().toEqualTypeOf<{ id: true; tab: false }>()
+    expectTypeOf<typeof route.Infer.ParamsDefinition>().toEqualTypeOf<{
+      id: { required: true; type: 'string' }
+      tab: { required: false; type: 'string' }
+    }>()
     expectTypeOf<typeof route.Infer.ParamsInput>().toEqualTypeOf<{
       id: string | number
       tab?: string | number | undefined
@@ -3146,7 +3177,10 @@ describe('Infer', () => {
     const route = Route0.create('/org/:org/users/:id')
     expect(route.get({ org: 'acme', id: '9' })).toBe('/org/acme/users/9')
 
-    expectTypeOf<typeof route.Infer.ParamsDefinition>().toEqualTypeOf<{ org: true; id: true }>()
+    expectTypeOf<typeof route.Infer.ParamsDefinition>().toEqualTypeOf<{
+      org: { required: true; type: 'string' }
+      id: { required: true; type: 'string' }
+    }>()
     expectTypeOf<typeof route.Infer.ParamsInput>().toEqualTypeOf<{
       org: string | number
       id: string | number
@@ -3160,9 +3194,9 @@ describe('Infer', () => {
     expect(required.get({ '*': '/a/b' })).toBe('/files/a/b')
     expect(optional.get()).toBe('/files')
 
-    expectTypeOf<typeof required.Infer.ParamsDefinition>().toEqualTypeOf<{ '*': true }>()
+    expectTypeOf<typeof required.Infer.ParamsDefinition>().toEqualTypeOf<{ '*': { required: true; type: 'string' } }>()
     expectTypeOf<typeof required.Infer.ParamsOutput>().toEqualTypeOf<{ '*': string }>()
-    expectTypeOf<typeof optional.Infer.ParamsDefinition>().toEqualTypeOf<{ '*': false }>()
+    expectTypeOf<typeof optional.Infer.ParamsDefinition>().toEqualTypeOf<{ '*': { required: false; type: 'string' } }>()
     expectTypeOf<typeof optional.Infer.ParamsOutput>().toEqualTypeOf<{ '*': string | undefined }>()
   })
 
@@ -3301,8 +3335,8 @@ describe('param constraints: grammar and tokens', () => {
     // param grammar must not swallow it.
     expect(Route0.create('/:id*').getTokens()).toEqual([{ kind: 'wildcard', prefix: ':id', optional: false }])
     expect(Route0.create('/:id*?').getTokens()).toEqual([{ kind: 'wildcard', prefix: ':id', optional: true }])
-    expect(Route0.create('/:id*').params).toEqual({ '*': true })
-    expect(Route0.create('/:id*?').params).toEqual({ '*': false })
+    expect(Route0.create('/:id*').params).toEqual({ '*': { required: true, type: 'string' } })
+    expect(Route0.create('/:id*?').params).toEqual({ '*': { required: false, type: 'string' } })
     expect(Route0.create('/:id*').get({ '*': '42' })).toBe('/:id42')
   })
 
@@ -3312,46 +3346,54 @@ describe('param constraints: grammar and tokens', () => {
     // compile error on a route that works.
     const route = Route0.create('/:id*')
     expect(route.get({ '*': '42' })).toBe('/:id42')
-    expectTypeOf(route.params).toEqualTypeOf<{ '*': true }>()
+    expectTypeOf(route.params).toEqualTypeOf<{ '*': { required: true; type: 'string' } }>()
     expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{ '*': string }>()
-    expectTypeOf<ParamsValues<'/:id*'>>().toEqualTypeOf<{ '*': string }>()
 
     const optional = Route0.create('/:id*?')
     expect(optional.get({})).toBe('/:id')
-    expectTypeOf(optional.params).toEqualTypeOf<{ '*': false }>()
+    expectTypeOf(optional.params).toEqualTypeOf<{ '*': { required: false; type: 'string' } }>()
     expectTypeOf<typeof optional.Infer.ParamsOutput>().toEqualTypeOf<{ '*': string | undefined }>()
   })
 
-  it('exposes allowed values', () => {
-    expect(Route0.create('/:locale(ru|en)?/post/:slug').getParamsValues()).toEqual({ locale: ['ru', 'en'] })
-    expect(Route0.create('/users/:id').getParamsValues()).toEqual({})
+  it('exposes allowed values on the param descriptor', () => {
+    expect(Route0.create('/:locale(ru|en)?/post/:slug').params).toEqual({
+      locale: { required: false, type: 'enum', values: ['ru', 'en'] },
+      slug: { required: true, type: 'string' },
+    })
+    // an unconstrained param carries no `values` at all, so `type` alone answers "is this restricted"
+    expect(Route0.create('/users/:id').params).toEqual({ id: { required: true, type: 'string' } })
   })
 
-  it('hands out a copy of the allowed values, not the route internals', () => {
+  it('freezes the descriptor so a caller cannot widen what the route matches', () => {
+    // `values` is shared with the token the matcher reads, so a mutation would let the schema accept a value the
+    // regex still rejects. Freezing is what makes handing `params` out as a field safe.
     const route = Route0.create('/:locale(ru|en)')
-    const values = route.getParamsValues() as { locale: string[] }
-    values.locale.push('de')
-    expect(route.getParamsValues()).toEqual({ locale: ['ru', 'en'] })
+    // no `type === 'enum'` guard needed: on a concrete definition the descriptor is already narrowed to that member
+    const definition = route.params.locale
+    // `readonly` is the type-level guard; this cast is the point of the test — prove the runtime array is frozen
+    expect(() => (definition.values as string[]).push('de')).toThrow()
+    expect(route.params).toEqual({ locale: { required: true, type: 'enum', values: ['ru', 'en'] } })
     expect(route.isExact('/de')).toBe(false)
   })
 
-  it('hands out a copy of a token`s values too', () => {
-    // `values` is the only non-primitive on a token: before it existed the shallow spread in getTokens() was a full
-    // copy, and losing that quietly let a caller widen what the route matches.
+  it('freezes the tokens too, and shares one values array with the descriptor', () => {
     const route = Route0.create('/:locale(ru|en)')
     const [token] = route.getTokens()
     if (token.kind !== 'param' || !token.values) {
       throw new Error('expected a constrained param token')
     }
-    // `readonly` is the type-level guard; this cast is the point of the test — prove the runtime array is a copy
-    ;(token.values as string[]).push('de')
-    expect(route.getTokens()).toEqual([{ kind: 'param', name: 'locale', optional: false, values: ['ru', 'en'] }])
-    expect(route.getParamsValues()).toEqual({ locale: ['ru', 'en'] })
+    expect(() => (token.values as string[]).push('de')).toThrow()
+    expect(() => (route.getTokens() as RouteToken[]).push({ kind: 'static', value: 'x' })).toThrow()
+    // one frozen array, not two defensive copies (the token types it wider than the descriptor does)
+    expect(route.params.locale.values as readonly string[]).toBe(token.values)
     expect(route.isExact('/de')).toBe(false)
   })
 
-  it('keeps params meaning "is required"', () => {
-    expect(Route0.create('/:locale(ru|en)?/post/:slug').params).toEqual({ locale: false, slug: true })
+  it('keeps required-ness on the descriptor', () => {
+    expect(Route0.create('/:locale(ru|en)?/post/:slug').params).toEqual({
+      locale: { required: false, type: 'enum', values: ['ru', 'en'] },
+      slug: { required: true, type: 'string' },
+    })
     expect(Route0.create('/:locale(ru|en)?').getParamsKeys()).toEqual(['locale'])
   })
 })
@@ -3632,7 +3674,7 @@ describe('param constraints: derived routes', () => {
       Route0.from('/:locale(ru|en)?'),
     ]
     for (const route of derived) {
-      expect(route.getParamsValues()).toEqual({ locale: ['ru', 'en'] })
+      expect(route.params.locale).toEqual({ required: false, type: 'enum', values: ['ru', 'en'] })
       expect(route.get({ locale: 'ru' })).toContain('/ru')
       expect(() => route.get({ locale: 'fr' as 'ru' })).toThrow(/must be one of "ru", "en"/)
     }
@@ -3664,9 +3706,12 @@ describe('param constraints: type inference', () => {
   it('produces a clean param key (no parens leaking into the name)', () => {
     const route = Route0.create('/:locale(ru|en)?')
     // `Infer` is a type-only carrier (`null as never`), so it must never be touched at runtime.
-    expectTypeOf(route.params).toEqualTypeOf<{ locale: false }>()
-    expectTypeOf<(typeof route.Infer)['ParamsValues']>().toEqualTypeOf<{ locale: 'ru' | 'en' }>()
-    expectTypeOf<(typeof route.Infer)['ParamsDefinition']>().toEqualTypeOf<{ locale: false }>()
+    expectTypeOf(route.params).toEqualTypeOf<{
+      locale: { required: false; type: 'enum'; values: readonly ('ru' | 'en')[] }
+    }>()
+    expectTypeOf<(typeof route.Infer)['ParamsDefinition']>().toEqualTypeOf<{
+      locale: { required: false; type: 'enum'; values: readonly ('ru' | 'en')[] }
+    }>()
   })
 
   it('mixes constrained, unconstrained and wildcard params', () => {
@@ -3692,8 +3737,10 @@ describe('param constraints: type inference', () => {
     const route = Route0.create('/:locale(ru|en)?/post/:slug')
     expect(route.get({ locale: 'ru', slug: 'hi' })).toBe('/ru/post/hi')
 
-    expectTypeOf<typeof route.Infer.ParamsDefinition>().toEqualTypeOf<{ locale: false; slug: true }>()
-    expectTypeOf<typeof route.Infer.ParamsValues>().toEqualTypeOf<{ locale: 'ru' | 'en'; slug: string }>()
+    expectTypeOf<typeof route.Infer.ParamsDefinition>().toEqualTypeOf<{
+      locale: { required: false; type: 'enum'; values: readonly ('ru' | 'en')[] }
+      slug: { required: true; type: 'string' }
+    }>()
     expectTypeOf<typeof route.Infer.ParamsInput>().toEqualTypeOf<{
       slug: string | number
       locale?: 'ru' | 'en' | undefined
@@ -3708,22 +3755,32 @@ describe('param constraints: type inference', () => {
     }>()
   })
 
-  it('exposes the value domain through the public helpers', () => {
-    expectTypeOf<ParamsValues<'/:locale(ru|en)?/post/:slug'>>().toEqualTypeOf<{ locale: 'ru' | 'en'; slug: string }>()
-    expectTypeOf<ParamsAllowedValues<'/:locale(ru|en)?/post/:slug'>>().toEqualTypeOf<{
-      locale: readonly ('ru' | 'en')[]
+  it('carries required-ness and the value domain on one descriptor', () => {
+    expectTypeOf<ParamsDefinition<'/:locale(ru|en)?/post/:slug'>>().toEqualTypeOf<{
+      locale: { required: false; type: 'enum'; values: readonly ('ru' | 'en')[] }
+      slug: { required: true; type: 'string' }
     }>()
-    expectTypeOf<ParamsDefinition<'/:locale(ru|en)?/post/:slug'>>().toEqualTypeOf<{ locale: false; slug: true }>()
-    // An unconstrained param's domain is exactly `string` — that is the test everything else keys off.
-    expectTypeOf<ParamsValues<'/user/:id/:tab?'>>().toEqualTypeOf<{ id: string; tab: string }>()
-    expectTypeOf<ParamsAllowedValues<'/user/:id/:tab?'>>().toEqualTypeOf<Record<never, never>>()
+    // An unconstrained param carries no `values` at all — `type: 'string'` is the whole story.
+    expectTypeOf<ParamsDefinition<'/user/:id/:tab?'>>().toEqualTypeOf<{
+      id: { required: true; type: 'string' }
+      tab: { required: false; type: 'string' }
+    }>()
   })
 
-  it('types getParamsValues() as literal values, constrained keys only', () => {
+  it('reads a single param off the descriptor by key', () => {
+    // The reason the two side-tables (`ParamsValues` / `ParamsAllowedValues`) are gone: one indexed access does it.
+    type Def = ParamsDefinition<'/:locale(ru|en)?/post/:slug'>
+    expectTypeOf<Def['locale']['required']>().toEqualTypeOf<false>()
+    expectTypeOf<Def['slug']['required']>().toEqualTypeOf<true>()
+    expectTypeOf<Def['locale']['type']>().toEqualTypeOf<'enum'>()
+    expectTypeOf<Def['slug']['type']>().toEqualTypeOf<'string'>()
+
     const route = Route0.create('/:locale(ru|en)?/post/:slug')
-    expect(route.getParamsValues()).toEqual({ locale: ['ru', 'en'] })
-    expectTypeOf(route.getParamsValues()).toEqualTypeOf<{ locale: readonly ('ru' | 'en')[] }>()
-    expectTypeOf(Route0.create('/users/:id').getParamsValues()).toEqualTypeOf<Record<never, never>>()
+    const locale = route.params.locale
+    expectTypeOf(locale.values).toEqualTypeOf<readonly ('ru' | 'en')[]>()
+    expect(locale.values).toEqual(['ru', 'en'])
+    // An unconstrained param has no `values` at all; that negative is pinned by the exact-shape assertion in
+    // "carries required-ness and the value domain on one descriptor", which fails if the key ever appears.
   })
 
   it('narrows getRelation params to the union', () => {
