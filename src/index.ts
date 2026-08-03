@@ -1579,8 +1579,7 @@ export type Definition<T extends AnyRoute | string> = T extends AnyRoute
  * levels and are meant to differ — do not "re-sync" them.
  */
 export type ParamDefinition =
-  | { required: boolean; type: 'string' }
-  | { required: boolean; type: 'enum'; values: readonly string[] }
+  { required: boolean; type: 'string' } | { required: boolean; type: 'enum'; values: readonly string[] }
 
 /** Every path param of a route, keyed by name. See {@link ParamDefinition} for the value. */
 export type ParamsDefinition<T extends AnyRoute | string> = T extends AnyRoute
@@ -1839,8 +1838,7 @@ export type _ParamsInput<TDefinition extends string> =
             >
           } & {
             [K in keyof TDef as TDef[K] extends { required: false } ? K : never]?:
-              | _ParamInputValue<_ParamValueOf<TDefinition, K>>
-              | undefined
+              _ParamInputValue<_ParamValueOf<TDefinition, K>> | undefined
           }
         >
       >
@@ -1858,8 +1856,7 @@ export type _ParamsInputStringOnly<TDefinition extends string> =
             >
           } & {
             [K in keyof TDef as TDef[K] extends { required: false } ? K : never]?:
-              | _ParamOutputValue<_ParamValueOf<TDefinition, K>>
-              | undefined
+              _ParamOutputValue<_ParamValueOf<TDefinition, K>> | undefined
           }
         >
       >
