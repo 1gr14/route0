@@ -102,6 +102,13 @@ jobs:
           name: build-files
           path: .
 
+      # npm 10 (bundled with Node 20/22) crashes on this install with "Cannot read properties of null
+      # (reading 'edgesOut')" — an arborist bug tripped by an optional-peer set somewhere in the resolved
+      # tree (registry-state dependent, so it can appear without any change on our side). npm 11 resolves
+      # the same tree fine; the release job already pins it for OIDC anyway.
+      - name: Upgrade npm (npm 10's arborist crashes resolving the peer set)
+        run: npm install -g npm@11
+
       - name: Install runtime peer deps
         run: npm install --no-save @1gr14/flat
 
