@@ -5,6 +5,8 @@ work; `bun run release` promotes that section to the new version.
 
 ## Unreleased
 
+## 0.4.0 — 2026-08-26
+
 - Feature: typed params — `:id[int]`, plus `[bool]`, `[num]`, `[bigint]`,
   `[uuid]`, `[date]`, `[datetime]` and the negative `[-int]`/`[-num]`/
   `[-bigint]`. A typed param matches only the type's canonical string form (no
