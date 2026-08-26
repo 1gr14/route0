@@ -14,11 +14,11 @@
 <!-- docs:start -->
 
 route0 turns a URL pattern into a set of fully-typed helpers. You write the
-pattern — `/idea/:id` — **once**, and from that single string you get a typed
-path builder, a URL parser, search-param handling, a
-[Standard Schema](https://standardschema.dev) validator, and the matching
-primitives you'd build a router from. Params are inferred from the pattern; you
-never hand-write their types.
+pattern — `/idea/:id[int]&page[int]=0` — **once**, and from that single string
+you get a typed path builder, a URL parser, typed path _and_ search params, a
+[Standard Schema](https://standardschema.dev) validator with JSON Schema output,
+and the matching primitives you'd build a router from. Params are inferred from
+the pattern — types, enums, defaults and all; you never hand-write them.
 
 ## Why
 
@@ -81,6 +81,14 @@ route.definition // '/org/:org/users/:id'  — the pattern back out
 route.params // { org: { required: true, type: 'string' }, id: { required: true, type: 'string' } }
 ```
 
+One rule to know up front: **building never throws.** The TS types are the
+strict layer; at runtime `get()` is best-effort — a value that slipped past the
+types (a form field, a DB row, JSON) produces a link that at worst matches
+nothing, a missing (or empty) required param emits the literal `undefined`, and
+an unset or malformed `origin` just keeps the URL relative. A broken href is a
+small bug; a page that dies rendering one is a big one. When you want loud
+validation, that's what `.schema` and `.searchSchema` are for.
+
 ## Optional and wildcard params
 
 Mark a param optional with a trailing `?`, or capture the rest of the path with
@@ -109,7 +117,7 @@ those values, and its type narrows from `string` to the literal union:
 const post = Route0.create('/:locale(ru|en)/post/:slug')
 
 post.get({ locale: 'ru', slug: 'hello' }) // '/ru/post/hello'
-post.get({ locale: 'fr', slug: 'hello' }) // ✗ type error — and throws at runtime
+post.get({ locale: 'fr', slug: 'hello' }) // ✗ type error — at runtime builds '/fr/post/hello', which matches nothing
 
 post.getRelation('/ru/post/hello').params // { locale: 'ru', slug: 'hello' }
 post.isExact('/fr/post/hello') // false — 'fr' is not a locale
@@ -118,11 +126,11 @@ type Params = typeof post.Infer.ParamsOutput
 // { locale: 'ru' | 'en'; slug: string }
 ```
 
-The narrowing runs in both directions: `get()` rejects a value you didn't list,
-and parsed params come back as the union — so a `switch` over `locale` is
-exhaustive and a typo is a compile error instead of a 404 you find in
-production. `.schema` validates against the same set, and the JSON Schema it
-emits carries it as an `enum`.
+The narrowing runs in both directions: `get()` rejects a value you didn't list
+at the type level, and parsed params come back as the union — so a `switch` over
+`locale` is exhaustive and a typo is a compile error instead of a 404 you find
+in production. `.schema` validates against the same set (loudly, unlike
+`get()`), and the JSON Schema it emits carries it as an `enum`.
 
 Add `?` after the closing parenthesis to make the param optional, exactly as
 with a plain one — which is how you get an optional locale prefix:
@@ -172,6 +180,176 @@ built in the type system: somewhere past fifty alternatives TypeScript gives up
 with an "excessively deep" error at the call site, which tells you nothing about
 what went wrong. The cap turns that into a clear message instead. If you need a
 larger set, use a plain param and check the value yourself.
+
+## Give a param a type
+
+Square brackets give a param a type. The param then matches only that type's
+canonical string form, `get()` demands the matching JS type, and parsed params
+come back converted — a real `number`, `boolean`, `bigint`, or `Date`:
+
+```ts
+const user = Route0.create('/users/:id[int]')
+
+user({ id: 42 }) // '/users/42'
+user({ id: '42' }) // ✗ type error — but the canonical string coerces at runtime: '/users/42'
+user.getRelation('/users/42').params // { id: 42 }  — a number, not a string
+user.isExact('/users/abc') // false
+user.isExact('/users/007') // false — leading zeros are not canonical
+
+type Params = typeof user.Infer.ParamsOutput // { id: number }
+```
+
+| Type         | Matches                                | JS value              |
+| ------------ | -------------------------------------- | --------------------- |
+| `[str]`      | anything — the default, spelled out    | `string`              |
+| `[bool]`     | `true` · `false`                       | `boolean`             |
+| `[int]`      | `0`, `42` — non-negative integers      | `number`              |
+| `[-int]`     | `-7` too (never `-0`)                  | `number`              |
+| `[num]`      | `3`, `1.5` — non-negative decimals     | `number`              |
+| `[-num]`     | `-1.5`, `-0.5` too                     | `number`              |
+| `[bigint]`   | like `[int]`, unlimited length         | `bigint`              |
+| `[-bigint]`  | like `[-int]`, unlimited length        | `bigint`              |
+| `[uuid]`     | `8-4-4-4-12` hex, either case          | `string`              |
+| `[date]`     | `2026-08-26`                           | `Date` (UTC midnight) |
+| `[datetime]` | ISO 8601 with a zone (`Z` or `±HH:MM`) | `Date`                |
+
+Numeric types are **non-negative by default** — URL params are mostly ids, pages
+and counts. The `-` modifier (`[-int]`, `[-num]`, `[-bigint]`) also allows the
+minus.
+
+Matching accepts **canonical forms only**: no leading zeros, no `+`, no
+exponents, no trailing fraction zeros, no `-0`. That keeps building and parsing
+a bijection — every URL that matches parses to a value that builds back into the
+same URL. `.schema` enforces the same canon from the other side (`{ id: 1.5 }`
+for `[int]` fails validation, so do `'007'` and an `Invalid Date`), while
+`get()` — never-throw by policy — emits such values best-effort into a link that
+matches nothing. At runtime both accept a typed value **or its canonical
+string** (`'3'` for `[int]`, an ISO string for `[date]`) — everything on the
+wire is a string anyway; the TS types stay strict. Combine with `?` for optional
+as usual: `:page[int]?`. An id that can outgrow 2^53 belongs in `[bigint]` —
+`[int]` matches any digit count, but `number` loses precision past
+`Number.MAX_SAFE_INTEGER`.
+
+Dates follow the JS spec's UTC convention: `[date]` parses to UTC midnight and
+builds from the Date's UTC components — so create link dates as
+`new Date('2026-08-26')`, not `new Date(2026, 7, 26)` (that's a _local_
+midnight, which shifts a day in some timezones). `[datetime]` is the one
+deliberate exception to strict bijection: parsing is lenient (a `Z` or a
+`±HH:MM` offset, optional seconds — a `Date` holds the exact instant either
+way), while building always emits the `toISOString()` canon.
+
+Types feed the conflict analysis too: routes whose types can't share a URL
+coexist freely, and genuinely ambiguous pairs are reported:
+
+```ts
+Route0.create('/x/:a[int]').isOverlap('/x/:b[uuid]') // false — no common URL
+Route0.create('/x/:a[int]').isConflict('/x/:b[num]') // false — int is tried first
+Route0.create('/x/:a[int]').isConflict('/x/:b[bigint]') // true — same strings, different values
+```
+
+`.schema` validates the typed values, and the JSON Schema it emits carries the
+right shapes: `[int]` → `{ type: 'integer', minimum: 0 }`, `[bool]` →
+`{ type: 'boolean' }`, `[uuid]` → `format: 'uuid'`, `[date]`/`[datetime]` →
+`format: 'date'`/`'date-time'`. Two documented gaps, because JSON has neither
+type: `[bigint]` is emitted as `integer` and the `Date`-valued types as
+formatted strings.
+
+## Prefix and suffix inside a segment
+
+A param doesn't have to own its whole segment — wrap it in literal text:
+
+```ts
+const image = Route0.create('/files/img-:id[int].png')
+
+image({ id: 7 }) // '/files/img-7.png'
+image.getRelation('/files/img-7.png').params // { id: 7 }
+image.isExact('/files/img-7.jpg') // false
+image.isExact('/files/img-x.png') // false — the body is still [int]
+
+Route0.create('/v:major[int]')({ major: 2 }) // '/v2'
+Route0.create('/:file.mp4').getRelation('/talk.mp4').params // { file: 'talk' }
+```
+
+Prefix and suffix are URL-unreserved literals (`[A-Za-z0-9_.~-]`); a second
+param is possible too, but only behind a delimiter — that's the next section. A
+trailing `?` makes the whole segment optional — prefix and suffix drop out
+together with the value:
+
+```ts
+const paged = Route0.create('/files/page-:n[int]?')
+paged({}) // '/files'
+paged({ n: 2 }) // '/files/page-2'
+```
+
+The param name is a `[A-Za-z0-9_]+` run, so a suffix starts at the first `.`,
+`~` or `-` (`:file.mp4` — name `file`, suffix `.mp4`), and any `:` in a
+non-wildcard segment is param intent: what doesn't parse is rejected at
+creation, never silently downgraded to a static segment.
+
+## A second param after a delimiter
+
+The classic file-extension shape — and ranges, and versions. A segment may carry
+a **tail param** after a one-character delimiter (`.`, `-` or `~`):
+
+```ts
+const file = Route0.create('/my/:slug.:ext')
+file({ slug: 'talk', ext: 'md' }) // '/my/talk.md'
+file.getRelation('/my/a.b.md').params // { slug: 'a.b', ext: 'md' }
+
+const version = Route0.create('/v:maj[int].:min[int]')
+version.getRelation('/v2.7').params // { maj: 2, min: 7 }
+
+const range = Route0.create('/range/:from-:to')
+range.getRelation('/range/a-b-c').params // { from: 'a-b', to: 'c' }
+```
+
+The rule that keeps this deterministic: **the tail can never contain its own
+delimiter** — a plain tail matches everything but it, an enum/typed tail is
+checked at creation (`:a-:d[date]` is rejected: a date contains `-`). So the
+split always lands on the _last_ delimiter, the first param may contain it
+freely, and building + parsing stay a round-trip (feeding a delimiter-carrying
+value INTO a tail is the one thing `.schema` flags for it). At most two params
+per segment, the tail always ends it.
+
+A trailing `?` on a two-param segment makes the **tail** optional — the
+delimiter disappears with it (on a single-param segment `?` still means the
+whole segment):
+
+```ts
+const doc = Route0.create('/my/:slug.:ext?')
+doc.getRelation('/my/talk.md').params // { slug: 'talk', ext: 'md' }
+doc.getRelation('/my/talk').params // { slug: 'talk', ext: undefined }
+doc({ slug: 'talk' }) // '/my/talk'
+doc.schema.safeParse({ slug: 'a.md' }).success // false — would re-parse as slug 'a' + ext 'md'
+doc({ slug: 'a.md', ext: 'txt' }) // '/my/a.md.txt' — providing the tail disambiguates
+```
+
+That validation failure is the bijection guard: a URL built without the tail
+must not come back _with_ one (`get()` itself stays never-throw and emits what
+you gave it). An enum tail narrows the guard to its own values —
+`/:name.:ext(md|txt)?` parses `/a.pdf` as `name: 'a.pdf'` (`.pdf` is no valid
+tail) and builds it back untouched.
+
+### Wildcard tails
+
+The same mechanics work on a wildcard — the file-server shapes:
+
+```ts
+const markdown = Route0.create('/docs/*.md')
+markdown.isExact('/docs/a/b/c.md') // true
+markdown.getRelation('/docs/a/b/c.md').params // { '*': 'a/b/c' }
+
+const raw = Route0.create('/raw/*.:ext')
+raw.getRelation('/raw/a/b.md').params // { '*': 'a/b', ext: 'md' }
+raw.isExact('/raw/a.b/c') // false — no extension in the last segment
+```
+
+A wildcard with a suffix or tail demands a non-empty body (`/docs/.md` and
+`/docs` don't match), the extension can only come from the **last** segment (the
+tail never contains `/` or the delimiter), and `*.:ext?` behaves like the param
+version, guard included. `*?` cannot carry a tail. Unlike a param's suffix, a
+wildcard's _literal_ suffix may even start with a letter (`/files/*_thumb`) —
+the star itself is the boundary, no name-run ambiguity to protect.
 
 ## Search params and hash
 
@@ -245,27 +423,95 @@ ideaEdit.definition // '/idea/:id/edit'
 ideaEdit({ id: '123' }) // '/idea/123/edit'
 ```
 
-## Typed search params
+## Declare search params in the pattern
 
-Search params are untyped by default. Call `.search<…>()` to lock in a shape —
-it's a type-only refinement (no runtime cost) that flows into `get()` and into
-the `Infer` types below:
+Search params can live right in the pattern, after the path, `&`-separated. Each
+declaration is a name plus optional modifiers, in this order: a `[type]` **or**
+an `(enum)`, then `[]` for an array, then `!` for required, then `=default`:
 
 ```ts
-const list = Route0.create('/idea').search<{
-  page?: number
-  sort?: 'new' | 'top'
+const list = Route0.create('/ideas&q&page[int]=0&sort(new|top)=new&ids[int][]')
+
+list({ '?': { page: 2, sort: 'top' } }) // '/ideas?page=2&sort=top'
+list({ '?': { page: '2' } }) // ✗ type error — but '2' coerces at runtime: '/ideas?page=2'
+list({}) // '/ideas' — defaults are never inserted into a URL
+
+list.searchParams.page // { required: false, array: false, type: 'int', default: 0 }
+
+type Search = typeof list.Infer.SearchInput
+// { q?: string | number; page?: number; sort?: 'new' | 'top'; ids?: number[] }
+```
+
+The rules, in brief:
+
+- **Optional by default.** `&token!` makes one required: `get()`'s input type
+  demands it and `searchSchema` fails without it (the never-throw `get()` just
+  omits it from the URL). Matching is never affected — see below.
+- **Defaults are parse-side only.** `&page[int]=0` means "absent in the URL ⇒
+  `0` in the parsed output". Building never inserts a default; a `!` or a `[]`
+  can't combine with `=` (rejected at creation).
+- **Arrays.** `&ids[int][]` — the wire format is `ids[]=1&ids[]=2`, a single
+  bare value counts as an array of one, and an absent array parses to `[]`,
+  never `undefined`.
+- **Strict vs loose.** Declaring params closes the `?` object to exactly those
+  keys. A trailing `&` (`/ideas&page[int]&`) keeps it open — declared keys
+  typed, anything else allowed. No `&` at all is today's fully-open behavior.
+- **Matching stays pathname-only.** Search never decides `isExact` or
+  `getRelation` — a route with a required search param still matches its path;
+  validation is the schema's job.
+
+### Parse and validate search
+
+Every route carries a `searchSchema` (Standard Schema, like `.schema`): it takes
+a parsed search object — raw URL strings and typed values alike — coerces
+declared keys, fills defaults, wraps arrays, and drops unknown keys in strict
+mode:
+
+```ts
+list.searchSchema.parse({ page: '2', ids: '7' })
+// { q: undefined, page: 2, sort: 'new', ids: [7] }
+list.searchSchema.safeParse({ page: 'abc' }).success // false
+```
+
+Its JSON Schemas mirror the coercion (input accepts the string forms,
+`additionalProperties` follows strict/loose). For a forgiving view there's
+`route.coerceSearch(obj)` — same conversion, but an invalid value degrades to
+its absent case instead of failing. That's exactly what a collection applies on
+a match, so `loc.search` arrives typed:
+
+```ts
+const routes = Routes.create({ list: '/ideas&q&page[int]=0&ids[int][]' })
+
+routes._.getLocation('/ideas?q=x&page=2&ids=7').search
+// { q: 'x', page: 2, ids: [7] }
+routes._.getLocation('/ideas?page=abc').search
+// { q: undefined, page: 0, ids: [] } — invalid degrades to the default
+```
+
+`extend()` concatenates declarations from both sides (duplicate names are
+rejected), so a section base can declare shared search params once.
+
+### `.search<T>()` — the escape hatch
+
+The string can only declare flat scalars. For nested shapes, call `.search<…>()`
+— a type-only refinement that merges _on top of_ the declared params (a key the
+pattern already declares is a type error):
+
+```ts
+const filtered = Route0.create('/ideas&page[int]').search<{
+  filter?: { price: { min: number; max: number } }
 }>()
 
-list.get({ '?': { page: 2, sort: 'top' } }) // '/idea?page=2&sort=top'
-list.get({ '?': { sort: 'nope' } }) // ✗ type error — 'nope' is not assignable
+filtered.get({ '?': { page: 2, filter: { price: { min: 10, max: 50 } } } })
+// '/ideas?page=2&filter[price][min]=10&filter[price][max]=50' (brackets encoded)
 ```
 
 ## Validate params with Standard Schema
 
 Every route exposes a `.schema` that implements
 [Standard Schema](https://standardschema.dev), so it parses and validates params
-(and coerces them to strings) and drops into any pipeline that speaks the spec:
+and drops into any pipeline that speaks the spec. A plain param coerces a
+`number` to its string; a typed param validates and keeps its JS type:
 
 ```ts
 const route = Route0.create('/x/:id/:slug?')
@@ -302,13 +548,16 @@ read it through `typeof`. The members:
 | ----------------------- | ----------------------------------------------------------------------- |
 | `ParamsDefinition`      | Map of param name → its descriptor (see `params` above).                |
 | `ParamsInput`           | What `get()` accepts — required as `string \| number`, optional opt-in. |
-| `ParamsInputStringOnly` | Same as `ParamsInput`, but strings only (no `number`).                  |
+| `ParamsInputStringOnly` | Same as `ParamsInput`, but every param in its URL-string form.          |
 | `ParamsOutput`          | Parsed params — required `string`, optional `string \| undefined`.      |
-| `SearchInput`           | The route's typed search params (set via `.search<…>()`).               |
+| `SearchInput`           | Everything `?` accepts: declared params + the `.search<…>()` addition.  |
+| `SearchInputStringOnly` | Same, but every declared param in its URL-string form.                  |
+| `SearchOutput`          | What `searchSchema` yields — coerced, defaults filled, arrays wrapped.  |
 
 For a param restricted to a set of values, `string` above is that param's
 literal union instead — and `ParamsInput` drops `number`, since a number could
-never be one of the listed values.
+never be one of the listed values. A typed param swaps in its JS type
+everywhere: `:id[int]` is `number` in and out, `:d[date]` is `Date`.
 
 Each member also exists as a standalone type — `ParamsOutput<typeof route>`,
 `ParamsDefinition<'/:locale(ru|en)?'>`, and so on — taking either a route or a
@@ -487,6 +736,28 @@ Route0.create('/:locale(ru|en)?/post/:slug').params.locale
 // { required: false, type: 'enum', values: ['ru', 'en'] }
 // an unrestricted param is `{ required, type: 'string' }` — no `values` key, and none on its token
 // tokens and descriptors are frozen: mutating them would widen the schema without widening the matcher
+
+// A typed param carries its type; segment prefix/suffix live on the token only
+Route0.create('/files/img-:id[int].png').getTokens()
+// [
+//   { kind: 'static', value: 'files' },
+//   { kind: 'param', name: 'id', optional: false, type: 'int', prefix: 'img-', suffix: '.png' },
+// ]
+Route0.create('/files/img-:id[int].png').params.id // { required: true, type: 'int' }
+
+// A tail param rides on its segment's token; its descriptor is a param like any other
+Route0.create('/my/:slug.:ext?').getTokens()
+// [
+//   { kind: 'static', value: 'my' },
+//   { kind: 'param', name: 'slug', optional: false, tail: { name: 'ext', optional: true, delimiter: '.' } },
+// ]
+
+// Declared search params have their own descriptor map
+Route0.create('/ideas&page[int]=0&ids[int][]').searchParams
+// {
+//   page: { required: false, array: false, type: 'int', default: 0 },
+//   ids: { required: false, array: true, type: 'int' },
+// }
 
 // Normalize "route or string" inputs — returns the same instance if already a route
 Route0.from('/users/:id') // a callable route

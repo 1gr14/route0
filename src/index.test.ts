@@ -13,6 +13,7 @@ import type {
   GetPathInput,
   GetPathInputByRoute,
   HasParams,
+  HasSearchDecls,
   HasWildcard,
   IsParamsOptional,
   IsSameParams,
@@ -23,6 +24,9 @@ import type {
   ParamsOutput,
   RouteToken,
   RoutesPretty,
+  SearchInput,
+  SearchInputStringOnly,
+  SearchOutput,
   UnknownLocation,
   UnknownSearchInput,
   WeakAncestorLocation,
@@ -705,10 +709,10 @@ describe('Route0', () => {
     // expect(pathHash1).toBe('/prefix/myid/mysn/suffix#zxc')
   })
 
-  it('abs default throw if no window.location.origin', () => {
+  it('abs without an origin falls back to the relative URL (the never-throw policy)', () => {
     const route0 = Route0.create('/path')
-    expect(() => route0.get(undefined, { origin: true })).toThrow()
-    expect(() => route0.abs()).toThrow()
+    expect(route0.get(undefined, { origin: true })).toBe('/path')
+    expect(route0.abs()).toBe('/path')
   })
 
   it('origin as string not throw if no window.location.origin', () => {
@@ -804,6 +808,7 @@ describe('Route0', () => {
 
   it('type errors: require params when defined', () => {
     const rWith = Route0.create('/a/:id', { origin: 'https://example.com' })
+    // get() never throws — a missing required param emits the literal 'undefined' (visible, greppable, unmatchable)
     // @ts-expect-error missing required path params
     expect(rWith.get()).toBe('/a/undefined')
 
@@ -815,7 +820,7 @@ describe('Route0', () => {
     expect(rWith.get({ '?': { q: '1' } })).toBe('/a/undefined?q=1')
 
     // @ts-expect-error params can not be sent as object value it should be argument
-    rWith.get({ params: { id: '1' } }) // not throw becouse this will not used
+    expect(rWith.get({ params: { id: '1' } })).toBe('/a/undefined')
     expect(rWith.get({ id: '1' })).toBe('/a/1')
 
     const rNo = Route0.create('/b')
@@ -1778,7 +1783,8 @@ describe('params schema', () => {
       $schema: 'https://json-schema.org/draft/2020-12/schema',
       type: 'object',
       required: ['id'],
-      additionalProperties: false,
+      // the runtime tolerates (and ignores) unknown keys, so the input schema does too; the output stays closed
+      additionalProperties: true,
       properties: {
         id: { anyOf: [{ type: 'string' }, { type: 'number' }] },
         slug: { anyOf: [{ type: 'string' }, { type: 'number' }] },
@@ -2381,9 +2387,7 @@ describe('regex', () => {
   })
 
   it('asterisk is reserved wildcard token and not treated as literal static', () => {
-    expect(() => Route0.create('/path*with*asterisks')).toThrow(
-      'Invalid route definition "/path*with*asterisks": wildcard must be trailing in its segment',
-    )
+    expect(() => Route0.create('/path*with*asterisks')).toThrow(/malformed wildcard segment/)
   })
 
   it('regex: works with escaped special characters', () => {
@@ -3162,6 +3166,17 @@ describe('Infer', () => {
     expectTypeOf<typeof route.Infer.ParamsInput>().toEqualTypeOf<ParamsInput<typeof route>>()
     expectTypeOf<typeof route.Infer.ParamsInputStringOnly>().toEqualTypeOf<ParamsInputStringOnly<typeof route>>()
     expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<ParamsOutput<typeof route>>()
+
+    const declared = Route0.create('/ideas&q&page[int]=0&ids[int][]').search<{ extra?: { deep: number } }>()
+    expect(declared.get({ '?': { page: 2 } })).toBe('/ideas?page=2')
+
+    expectTypeOf<typeof declared.Infer.SearchInput>().toEqualTypeOf<SearchInput<typeof declared>>()
+    expectTypeOf<typeof declared.Infer.SearchInputStringOnly>().toEqualTypeOf<SearchInputStringOnly<typeof declared>>()
+    expectTypeOf<typeof declared.Infer.SearchOutput>().toEqualTypeOf<SearchOutput<typeof declared>>()
+    // a bare definition string works too — it just carries no `.search<T>()` addition
+    expectTypeOf<SearchOutput<'/ideas&page[int]=0'>>().toEqualTypeOf<{ page: number }>()
+    expectTypeOf<HasSearchDecls<'/ideas&page[int]=0'>>().toEqualTypeOf<true>()
+    expectTypeOf<HasSearchDecls<'/ideas'>>().toEqualTypeOf<false>()
   })
 
   it('infers empty params for a route with no params', () => {
@@ -3412,9 +3427,6 @@ describe('param constraints: definition validation', () => {
   // Before the grammar existed, every one of these silently became a STATIC literal that could never match, and
   // regexDescendantMatchers invented a phantom param out of the leftovers. They must all throw.
   const malformed: Array<[definition: string, why: string]> = [
-    ['/:na-me', 'a hyphen is not part of the name grammar'],
-    ['/:name-x', 'same, with the hyphen at the end'],
-    ['/:id.json', 'a dot is not part of the name grammar either'],
     ['/:', 'no name at all'],
     ['/:(ru|en)', 'constraint but no name'],
     ['/:name(', 'the paren is never closed'],
@@ -3428,7 +3440,6 @@ describe('param constraints: definition validation', () => {
     ['/:locale(ру|en)', 'a non-ASCII value'],
     ['/:locale(ru|én)', 'a non-ASCII accent in an otherwise ASCII value'],
     ['/:locale(ru|en]', 'mismatched bracket'],
-    ['/:name(a|b)x', 'trailing garbage after the constraint'],
     ['/:name(a)(b)', 'two constraints on one param'],
     ['/:name?(a|b)', 'the "?" goes after the constraint, not before'],
     ['/:locale(ru|en)??', 'a doubled "?"'],
@@ -3440,15 +3451,16 @@ describe('param constraints: definition validation', () => {
   }
 
   it('states the whole grammar in the message', () => {
-    expect(messageOf('/:na-me')).toContain('Expected ":name", ":name?", ":name(a|b)" or ":name(a|b)?"')
-    expect(messageOf('/:na-me')).toContain('the name is [A-Za-z0-9_]+')
-    expect(messageOf('/:na-me')).toContain('each allowed value is [A-Za-z0-9_.~-]+')
+    expect(messageOf('/:')).toContain('Expected ":name", ":name(a|b)" or ":name[int]"')
+    expect(messageOf('/:')).toContain('optionally wrapped in a literal prefix/suffix')
+    expect(messageOf('/:')).toContain('a tail param (":slug.:ext")')
+    expect(messageOf('/:')).toContain('a name is [A-Za-z0-9_]+')
   })
 
   it('blames the "(" only when it is genuinely unbalanced', () => {
     expect(messageOf('/:name(a/b)')).toContain('The "(" is never closed')
     expect(messageOf('/:name(a|b')).toContain('The "(" is never closed')
-    expect(messageOf('/:na-me')).not.toContain('never closed')
+    expect(messageOf('/:')).not.toContain('never closed')
     expect(messageOf('/:name()')).not.toContain('never closed')
   })
 
@@ -3486,9 +3498,9 @@ describe('param constraints: definition validation', () => {
   })
 
   it('validates on every construction path, not just Route0.create', () => {
-    expect(() => Route0.from('/:na-me')).toThrow(/Invalid route definition/)
-    expect(() => Route0.create('/ok').extend('/:na-me')).toThrow(/Invalid route definition/)
-    expect(() => Routes.create({ bad: '/:na-me' })).toThrow(/Invalid route definition/)
+    expect(() => Route0.from('/:')).toThrow(/Invalid route definition/)
+    expect(() => Route0.create('/ok').extend('/:')).toThrow(/Invalid route definition/)
+    expect(() => Routes.create({ bad: '/:' })).toThrow(/Invalid route definition/)
   })
 })
 
@@ -3558,11 +3570,11 @@ describe('param constraints: building', () => {
     expect(route.get({})).toBe('/author')
   })
 
-  it('throws on a disallowed value', () => {
+  it('emits a disallowed value as-is — a broken link, never a throw', () => {
     // @ts-expect-error 'fr' is not an allowed locale
-    expect(() => route.get({ locale: 'fr' })).toThrow(
-      'Invalid params for route "/:locale(ru|en)?/author": "locale" must be one of "ru", "en" (received "fr")',
-    )
+    expect(route.get({ locale: 'fr' })).toBe('/fr/author')
+    expect(route.isExact('/fr/author')).toBe(false) // ...and that link matches nothing
+    expect(route.schema.safeParse({ locale: 'fr' }).success).toBe(false) // the schema is the loud path
   })
 
   it('never leaks the constraint into the produced URL', () => {
@@ -3676,7 +3688,7 @@ describe('param constraints: derived routes', () => {
     for (const route of derived) {
       expect(route.params.locale).toEqual({ required: false, type: 'enum', values: ['ru', 'en'] })
       expect(route.get({ locale: 'ru' })).toContain('/ru')
-      expect(() => route.get({ locale: 'fr' as 'ru' })).toThrow(/must be one of "ru", "en"/)
+      expect(route.schema.safeParse({ locale: 'fr' as 'ru' }).success).toBe(false)
     }
   })
 
@@ -3840,7 +3852,8 @@ describe('param constraints: type inference', () => {
     expectTypeOf<typeof fromString.Infer.ParamsOutput>().toEqualTypeOf<{ locale: 'ru' | 'en' | undefined }>()
 
     // @ts-expect-error the constraint survives every derivation
-    expect(() => extended.get({ locale: 'fr' })).toThrow('must be one of "ru", "en"')
+    expect(extended.get({ locale: 'fr' })).toBe('/fr/author')
+    expect(extended.schema.safeParse({ locale: 'fr' }).success).toBe(false)
   })
 
   it('keeps the union through a Routes collection', () => {
@@ -3858,42 +3871,1657 @@ describe('param constraints: type inference', () => {
     }>()
 
     // @ts-expect-error 'de' is not an allowed locale
-    expect(() => routes.author({ locale: 'de' })).toThrow('must be one of "ru", "en"')
+    expect(routes.author({ locale: 'de' })).toBe('/de/author') // emitted as-is — a link that matches nothing
   })
 
-  it('rejects disallowed values and numbers at the call site', () => {
+  it('rejects disallowed values and numbers at the call site — types only, runtime emits best-effort', () => {
     const route = Route0.create('/:locale(ru|en)?/author')
     route.get({ locale: 'ru' })
     route.get({})
     // @ts-expect-error 'fr' is not an allowed locale
-    expect(() => route.get({ locale: 'fr' })).toThrow()
+    expect(route.get({ locale: 'fr' })).toBe('/fr/author')
     // @ts-expect-error a constrained param does not accept a number
-    expect(() => route.get({ locale: 1 })).toThrow()
+    expect(route.get({ locale: 1 })).toBe('/1/author')
 
     const required = Route0.create('/:locale(ru|en)/author')
     // @ts-expect-error a required constrained param cannot be omitted
-    expect(() => required.get({})).toThrow(/"locale" is required and must be one of "ru", "en"/)
+    expect(required.get({})).toBe('/undefined/author')
   })
 
   it('narrows abs() exactly like get()', () => {
     const route = Route0.create('/:locale(ru|en)?/author', { origin: 'https://example.com' })
     expect(route.abs({ locale: 'ru' })).toBe('https://example.com/ru/author')
     // @ts-expect-error 'fr' is not an allowed locale
-    expect(() => route.abs({ locale: 'fr' })).toThrow('must be one of "ru", "en"')
+    expect(route.abs({ locale: 'fr' })).toBe('https://example.com/fr/author')
   })
 
   it('does not let one constrained param borrow another one values', () => {
     const deploy = Route0.create('/:env(dev|prod)/:tier(free|pro)')
     expect(deploy.get({ env: 'dev', tier: 'pro' })).toBe('/dev/pro')
     expectTypeOf<typeof deploy.Infer.ParamsOutput>().toEqualTypeOf<{ env: 'dev' | 'prod'; tier: 'free' | 'pro' }>()
-    // @ts-expect-error 'free' belongs to tier, not env
-    expect(() => deploy.get({ env: 'free', tier: 'pro' })).toThrow('"env" must be one of "dev", "prod"')
+    // @ts-expect-error 'free' belongs to tier, not env — a type error, and the schema rejects it too
+    expect(deploy.get({ env: 'free', tier: 'pro' })).toBe('/free/pro')
+    expect(deploy.schema.safeParse({ env: 'free', tier: 'pro' }).success).toBe(false)
   })
 
-  it('keeps the legacy "undefined" fallback for a missing UNCONSTRAINED required param', () => {
-    // Pre-existing wart, deliberately untouched: only the constrained case throws, because only there do we know the
-    // built URL could never match its own route.
+  it('emits the literal "undefined" for a missing required param, constrained or not', () => {
+    // get() never throws: the miss stays visible and greppable, the schema stays the loud path.
     // @ts-expect-error id is required
     expect(Route0.create('/:id/author').get({})).toBe('/undefined/author')
+    // @ts-expect-error locale is required
+    expect(Route0.create('/:locale(ru|en)/author').get({})).toBe('/undefined/author')
+    expect(Route0.create('/:id/author').schema.safeParse({}).success).toBe(false)
+  })
+})
+
+describe('param types: grammar and tokens', () => {
+  it('parses a typed param into a token carrying the type', () => {
+    expect(Route0.create('/n/:id[int]').getTokens()).toEqual([
+      { kind: 'static', value: 'n' },
+      { kind: 'param', name: 'id', optional: false, type: 'int' },
+    ])
+  })
+
+  it('parses an optional typed param', () => {
+    expect(Route0.create('/n/:id[int]?').getTokens()).toEqual([
+      { kind: 'static', value: 'n' },
+      { kind: 'param', name: 'id', optional: true, type: 'int' },
+    ])
+    expect(Route0.create('/n/:id[int]?').params.id).toEqual({ required: false, type: 'int' })
+  })
+
+  it('[str] is the explicit default and normalizes away', () => {
+    const route = Route0.create('/s/:name[str]')
+    expect(route.getTokens()).toEqual([
+      { kind: 'static', value: 's' },
+      { kind: 'param', name: 'name', optional: false },
+    ])
+    expect(route.params.name).toEqual({ required: true, type: 'string' })
+    expect(route.get({ name: 'a' })).toBe('/s/a')
+  })
+
+  it('exposes the type on the descriptor', () => {
+    expect(Route0.create('/:flag[bool]/:d[date]?').params).toEqual({
+      flag: { required: true, type: 'bool' },
+      d: { required: false, type: 'date' },
+    })
+  })
+
+  it('rejects an unknown type with the list of valid ones', () => {
+    expect(() => Route0.create('/:id[foo]')).toThrow(/unknown param type "\[foo\]"/)
+    expect(() => Route0.create('/:id[foo]')).toThrow(/\[str\], \[bool\], \[int\], \[-int\]/)
+  })
+
+  it('rejects an uppercase or malformed type as a malformed segment', () => {
+    expect(() => Route0.create('/:id[INT]')).toThrow(/malformed param segment/)
+    expect(() => Route0.create('/:id[int')).toThrow(/malformed param segment/)
+    expect(() => Route0.create('/:id[]')).toThrow(/malformed param segment/)
+  })
+
+  it('rejects combining an enum and a type', () => {
+    expect(() => Route0.create('/:id(a|b)[int]')).toThrow(/malformed param segment/)
+    expect(() => Route0.create('/:id[int](a|b)')).toThrow(/malformed param segment/)
+  })
+
+  it('rejects a typed wildcard', () => {
+    expect(() => Route0.create('/:files*[int]')).toThrow(/wildcard cannot carry a type/)
+  })
+
+  it('still rejects duplicate param names across typed params', () => {
+    expect(() => Route0.create('/:id[int]/:id[num]')).toThrow(/duplicate param name/)
+  })
+})
+
+describe('param types: matching and parsing', () => {
+  it('int matches canonical non-negative integers only and parses to number', () => {
+    const route = Route0.create('/n/:id[int]')
+    expect(route.isExact('/n/42')).toBe(true)
+    expect(route.isExact('/n/0')).toBe(true)
+    expect(route.isExact('/n/007')).toBe(false) // leading zeros are non-canonical
+    expect(route.isExact('/n/-5')).toBe(false) // negatives need [-int]
+    expect(route.isExact('/n/1.5')).toBe(false)
+    expect(route.isExact('/n/abc')).toBe(false)
+    const relation = route.getRelation('/n/42')
+    expect(relation.params).toEqual({ id: 42 })
+    if (relation.type === 'exact') {
+      expectTypeOf(relation.params).toEqualTypeOf<{ id: number }>()
+    } else {
+      throw new Error('expected exact')
+    }
+  })
+
+  it('-int adds negatives but not -0', () => {
+    const route = Route0.create('/n/:delta[-int]')
+    expect(route.isExact('/n/-5')).toBe(true)
+    expect(route.isExact('/n/0')).toBe(true)
+    expect(route.isExact('/n/-0')).toBe(false)
+    expect(route.getRelation('/n/-5').params).toEqual({ delta: -5 })
+  })
+
+  it('num matches canonical decimals', () => {
+    const route = Route0.create('/n/:v[num]')
+    expect(route.isExact('/n/1.5')).toBe(true)
+    expect(route.isExact('/n/0.5')).toBe(true)
+    expect(route.isExact('/n/3')).toBe(true)
+    expect(route.isExact('/n/1.50')).toBe(false) // trailing zero — non-canonical
+    expect(route.isExact('/n/.5')).toBe(false)
+    expect(route.isExact('/n/5.')).toBe(false)
+    expect(route.isExact('/n/-1.5')).toBe(false)
+    expect(route.getRelation('/n/1.5').params).toEqual({ v: 1.5 })
+  })
+
+  it('-num adds negatives including -0.5 but not -0', () => {
+    const route = Route0.create('/n/:v[-num]')
+    expect(route.isExact('/n/-0.5')).toBe(true)
+    expect(route.isExact('/n/-3')).toBe(true)
+    expect(route.isExact('/n/-0')).toBe(false)
+    expect(route.getRelation('/n/-0.5').params).toEqual({ v: -0.5 })
+  })
+
+  it('bigint parses to BigInt', () => {
+    const route = Route0.create('/b/:id[bigint]')
+    const huge = '9007199254740993' // MAX_SAFE_INTEGER + 2 — survives only as a bigint
+    expect(route.isExact(`/b/${huge}`)).toBe(true)
+    expect(route.getRelation(`/b/${huge}`).params).toEqual({ id: 9007199254740993n })
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{ id: bigint }>()
+  })
+
+  it('bool matches exactly true|false', () => {
+    const route = Route0.create('/f/:flag[bool]')
+    expect(route.isExact('/f/true')).toBe(true)
+    expect(route.isExact('/f/false')).toBe(true)
+    expect(route.isExact('/f/True')).toBe(false)
+    expect(route.isExact('/f/1')).toBe(false)
+    expect(route.getRelation('/f/true').params).toEqual({ flag: true })
+    expect(route.getRelation('/f/false').params).toEqual({ flag: false })
+  })
+
+  it('uuid matches both cases and parses to the string as-is', () => {
+    const route = Route0.create('/u/:id[uuid]')
+    expect(route.isExact('/u/123e4567-e89b-12d3-a456-426614174000')).toBe(true)
+    expect(route.isExact('/u/123E4567-E89B-12D3-A456-426614174000')).toBe(true)
+    expect(route.isExact('/u/123e4567e89b12d3a456426614174000')).toBe(false)
+    expect(route.isExact('/u/zzze4567-e89b-12d3-a456-426614174000')).toBe(false)
+    expect(route.getRelation('/u/123e4567-e89b-12d3-a456-426614174000').params).toEqual({
+      id: '123e4567-e89b-12d3-a456-426614174000',
+    })
+  })
+
+  it('date matches month-aware YYYY-MM-DD and parses to a UTC-midnight Date', () => {
+    const route = Route0.create('/d/:d[date]')
+    expect(route.isExact('/d/2026-08-26')).toBe(true)
+    expect(route.isExact('/d/2026-13-01')).toBe(false)
+    expect(route.isExact('/d/2026-04-31')).toBe(false) // April has 30 days
+    expect(route.isExact('/d/2026-02-30')).toBe(false)
+    expect(route.isExact('/d/26-08-26')).toBe(false)
+    const relation = route.getRelation('/d/2026-08-26')
+    if (relation.type !== 'exact') throw new Error('expected exact')
+    expect(relation.params.d).toBeInstanceOf(Date)
+    expect(relation.params.d.getTime()).toBe(Date.UTC(2026, 7, 26))
+    expectTypeOf(relation.params).toEqualTypeOf<{ d: Date }>()
+  })
+
+  it('datetime matches ISO with a mandatory zone, colons raw or percent-encoded', () => {
+    const route = Route0.create('/t/:t[datetime]')
+    expect(route.isExact('/t/2026-08-26T10:00:00.000Z')).toBe(true)
+    expect(route.isExact('/t/2026-08-26T10%3A00%3A00.000Z')).toBe(true)
+    expect(route.isExact('/t/2026-08-26T10:00Z')).toBe(true) // seconds optional
+    expect(route.isExact('/t/2026-08-26T10:00:00+03:00')).toBe(true) // offset form
+    expect(route.isExact('/t/2026-08-26T10%3A00%3A00%2B03%3A00')).toBe(true) // fully encoded
+    expect(route.isExact('/t/2026-08-26T10:00:00')).toBe(false) // zone is mandatory
+    expect(route.isExact('/t/2026-08-26')).toBe(false)
+    const utc = route.getRelation('/t/2026-08-26T10:00:00.000Z').params as { t: Date }
+    expect(utc.t.getTime()).toBe(Date.UTC(2026, 7, 26, 10))
+    // an offset holds the same instant, shifted
+    const offset = route.getRelation('/t/2026-08-26T10%3A00%3A00%2B03%3A00').params as { t: Date }
+    expect(offset.t.getTime()).toBe(Date.UTC(2026, 7, 26, 7))
+  })
+
+  it('converts typed params in ancestor and descendant relations too', () => {
+    const route = Route0.create('/n/:id[int]')
+    expect(route.getRelation('/n/42/extra').params).toEqual({ id: 42 })
+    const deep = Route0.create('/n/:id[int]/posts')
+    expect(deep.getRelation('/n/42').params).toEqual({ id: 42 })
+  })
+
+  it('optional typed param parses to undefined when absent', () => {
+    const route = Route0.create('/n/:id[int]?')
+    expect(route.getRelation('/n').params).toEqual({ id: undefined })
+    expect(route.getRelation('/n/5').params).toEqual({ id: 5 })
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{ id: number | undefined }>()
+  })
+})
+
+describe('param types: building', () => {
+  it('builds from the typed value, coercing the canonical string form at runtime', () => {
+    const route = Route0.create('/n/:id[int]')
+    expect(route.get({ id: 42 })).toBe('/n/42')
+    expect(route.get({ id: 0 })).toBe('/n/0')
+    // the canonical string form is accepted at runtime (a type error remains — types are the strict layer)
+    // @ts-expect-error string is not accepted for [int] at the type level
+    expect(route.get({ id: '42' })).toBe('/n/42')
+    // anything else emits best-effort — a link that matches nothing, never a throw
+    // @ts-expect-error boolean is not accepted for [int]
+    expect(route.get({ id: true })).toBe('/n/true')
+    expect(route.isExact('/n/true')).toBe(false)
+  })
+
+  it('emits non-canonical numbers as-is — the schema is the loud layer', () => {
+    const int = Route0.create('/n/:id[int]')
+    expect(int.get({ id: 1.5 })).toBe('/n/1.5')
+    expect(int.get({ id: -1 })).toBe('/n/-1')
+    expect(int.get({ id: NaN })).toBe('/n/NaN')
+    expect(int.isExact('/n/1.5')).toBe(false) // none of these match the route
+    expect(int.schema.safeParse({ id: 1.5 }).success).toBe(false)
+    // @ts-expect-error non-canonical string stays a broken link too
+    expect(int.get({ id: '007' })).toBe('/n/007')
+    const neg = Route0.create('/n/:id[-int]')
+    expect(neg.get({ id: -1 })).toBe('/n/-1')
+    const num = Route0.create('/n/:v[num]')
+    expect(num.get({ v: 1.5 })).toBe('/n/1.5')
+    expect(num.get({ v: -0 })).toBe('/n/0') // String(-0) is '0'
+    expect(Route0.create('/n/:v[-num]').get({ v: -1.5 })).toBe('/n/-1.5')
+  })
+
+  it('builds bool and bigint, with string forms coerced', () => {
+    const flag = Route0.create('/f/:flag[bool]')
+    expect(flag.get({ flag: true })).toBe('/f/true')
+    expect(flag.get({ flag: false })).toBe('/f/false')
+    // @ts-expect-error string form accepted at runtime only
+    expect(flag.get({ flag: 'true' })).toBe('/f/true')
+    const big = Route0.create('/b/:id[bigint]')
+    expect(big.get({ id: 9007199254740993n })).toBe('/b/9007199254740993')
+    // @ts-expect-error number is not accepted for [bigint] at the type level — String(42) happens to be canonical
+    expect(big.get({ id: 42 })).toBe('/b/42')
+    expect(Route0.create('/b/:id[-bigint]').get({ id: -1n })).toBe('/b/-1')
+  })
+
+  it('builds uuid from a string, emitting a non-uuid as-is', () => {
+    const route = Route0.create('/u/:id[uuid]')
+    expect(route.get({ id: '123e4567-e89b-12d3-a456-426614174000' })).toBe('/u/123e4567-e89b-12d3-a456-426614174000')
+    expect(route.get({ id: 'nope' })).toBe('/u/nope')
+    expect(route.isExact('/u/nope')).toBe(false)
+  })
+
+  it('builds date from a Date via UTC components, ISO strings coerced', () => {
+    const route = Route0.create('/d/:d[date]')
+    expect(route.get({ d: new Date('2026-08-26') })).toBe('/d/2026-08-26')
+    // @ts-expect-error string form accepted at runtime only
+    expect(route.get({ d: '2026-08-26' })).toBe('/d/2026-08-26')
+    expect(route.get({ d: new Date('garbage') })).toBe('/d/Invalid%20Date') // best-effort, matches nothing
+  })
+
+  it('builds datetime canonically (toISOString), encoded by default', () => {
+    const route = Route0.create('/t/:t[datetime]')
+    const date = new Date('2026-08-26T10:00:00.000Z')
+    expect(route.get({ t: date })).toBe('/t/2026-08-26T10%3A00%3A00.000Z')
+    expect(route.get({ t: date }, { encode: false })).toBe('/t/2026-08-26T10:00:00.000Z')
+    // round-trip: built URL matches and parses back to the same instant
+    expect(route.isExact(route.get({ t: date }))).toBe(true)
+    expect((route.getRelation(route.get({ t: date })).params as { t: Date }).t.getTime()).toBe(date.getTime())
+  })
+
+  it('omits an optional typed param', () => {
+    const route = Route0.create('/n/:id[int]?')
+    expect(route.get({})).toBe('/n')
+    expect(route.get({ id: 5 })).toBe('/n/5')
+  })
+
+  it('emits the literal "undefined" for a missing required typed param', () => {
+    // @ts-expect-error id is required
+    expect(Route0.create('/n/:id[int]').get({})).toBe('/n/undefined')
+  })
+})
+
+describe('param types: schema and JSON Schema', () => {
+  it('validates and passes typed values through', () => {
+    const route = Route0.create('/n/:id[int]/:flag[bool]?')
+    expect(route.schema.parse({ id: 42, flag: true })).toEqual({ id: 42, flag: true })
+    expect(route.schema.parse({ id: 42 })).toEqual({ id: 42, flag: undefined })
+    expect(route.schema.parse({ id: '42' })).toEqual({ id: 42, flag: undefined }) // canonical string coerces
+    expect(route.schema.safeParse({ id: '4.2' }).success).toBe(false)
+    expect(route.schema.safeParse({ id: '007' }).success).toBe(false)
+    expect(route.schema.safeParse({ id: 'zxc' }).success).toBe(false)
+    expect(route.schema.safeParse({ id: 1.5 }).success).toBe(false)
+    expect(route.schema.safeParse({ id: -1 }).success).toBe(false)
+    expect(route.schema.safeParse({}).success).toBe(false)
+  })
+
+  it('validates Date params', () => {
+    const route = Route0.create('/d/:d[date]')
+    const date = new Date('2026-08-26')
+    expect(route.schema.parse({ d: date })).toEqual({ d: date })
+    expect(route.schema.parse({ d: '2026-08-26' })).toEqual({ d: date }) // ISO string coerces to the Date
+    expect(route.schema.safeParse({ d: '2026-13-01' }).success).toBe(false)
+    expect(route.schema.safeParse({ d: new Date('garbage') }).success).toBe(false)
+  })
+
+  it('emits typed JSON Schemas', () => {
+    const route = Route0.create('/:id[int]/:delta[-int]?/:flag[bool]?/:u[uuid]?/:d[date]?/:t[datetime]?/:big[bigint]?')
+    const input = route.schema['~standard'].jsonSchema.input({ target: 'draft-2020-12' }) as Record<string, any>
+    expect(input.properties.id).toEqual({ type: 'integer', minimum: 0 })
+    expect(input.properties.delta).toEqual({ type: 'integer' })
+    expect(input.properties.flag).toEqual({ type: 'boolean' })
+    expect(input.properties.u).toEqual({ type: 'string', format: 'uuid' })
+    expect(input.properties.d).toEqual({ type: 'string', format: 'date' })
+    expect(input.properties.t).toEqual({ type: 'string', format: 'date-time' })
+    expect(input.properties.big).toEqual({ type: 'integer', minimum: 0 })
+    expect(input.required).toEqual(['id'])
+    const output = route.schema['~standard'].jsonSchema.output({ target: 'draft-2020-12' }) as Record<string, any>
+    expect(output.properties.id).toEqual({ type: 'integer', minimum: 0 })
+    expect(output.properties.flag).toEqual({ type: 'boolean' })
+  })
+
+  it('num emits number schemas', () => {
+    const route = Route0.create('/:v[num]/:w[-num]?')
+    const input = route.schema['~standard'].jsonSchema.input({ target: 'draft-2020-12' }) as Record<string, any>
+    expect(input.properties.v).toEqual({ type: 'number', minimum: 0 })
+    expect(input.properties.w).toEqual({ type: 'number' })
+  })
+})
+
+describe('param types: specificity, overlap and conflicts', () => {
+  it('identical languages are a real conflict (int vs bigint)', () => {
+    expect(Route0.create('/x/:a[int]').isConflict('/x/:b[bigint]')).toBe(true)
+    expect(Route0.create('/x/:a[-int]').isConflict('/x/:b[-bigint]')).toBe(true)
+    expect(Route0.create('/x/:a[int]').isConflict('/x/:b[int]')).toBe(true)
+  })
+
+  it('nested languages resolve by ordering, narrower first (int vs num)', () => {
+    expect(Route0.create('/x/:a[int]').isOverlap('/x/:b[num]')).toBe(true)
+    expect(Route0.create('/x/:a[int]').isConflict('/x/:b[num]')).toBe(false)
+    expect(Route0.create('/x/:a[int]').isMoreSpecificThan('/x/:b[num]')).toBe(true)
+    expect(Route0.create('/x/:a[num]').isMoreSpecificThan('/x/:b[-num]')).toBe(true)
+  })
+
+  it('crossing languages are a real conflict (num vs -int share the naturals)', () => {
+    expect(Route0.create('/x/:a[num]').isOverlap('/x/:b[-int]')).toBe(true)
+    expect(Route0.create('/x/:a[num]').isConflict('/x/:b[-int]')).toBe(true)
+  })
+
+  it('disjoint languages coexist freely (int vs uuid vs bool vs date)', () => {
+    expect(Route0.create('/x/:a[int]').isOverlap('/x/:b[uuid]')).toBe(false)
+    expect(Route0.create('/x/:a[int]').isConflict('/x/:b[uuid]')).toBe(false)
+    expect(Route0.create('/x/:a[bool]').isOverlap('/x/:b[date]')).toBe(false)
+    expect(Route0.create('/x/:a[date]').isOverlap('/x/:b[datetime]')).toBe(false)
+  })
+
+  it('a static segment overlaps a type only when the value matches it', () => {
+    expect(Route0.create('/x/42').isOverlap('/x/:n[int]')).toBe(true)
+    expect(Route0.create('/x/abc').isOverlap('/x/:n[int]')).toBe(false)
+    expect(Route0.create('/x/true').isOverlap('/x/:b[bool]')).toBe(true)
+  })
+
+  it('an enum overlaps a type only when some value matches it', () => {
+    expect(Route0.create('/x/:k(42|abc)').isOverlap('/x/:n[int]')).toBe(true)
+    expect(Route0.create('/x/:k(abc|def)').isOverlap('/x/:n[int]')).toBe(false)
+  })
+
+  it('a typed param sits between an enum and a plain param', () => {
+    expect(Route0.create('/x/:k(a|b)').isMoreSpecificThan('/x/:n[int]')).toBe(true)
+    expect(Route0.create('/x/:n[int]').isMoreSpecificThan('/x/:p')).toBe(true)
+    expect(Route0.create('/x/static').isMoreSpecificThan('/x/:n[int]')).toBe(true)
+  })
+
+  it('routes a URL to the narrowest matching typed route', () => {
+    const routes = Routes.create({
+      untyped: '/x/:s',
+      floaty: '/x/:v[num]',
+      inty: '/x/:n[int]',
+    })
+    expect(routes._.pathsOrdering).toEqual(['/x/:n[int]', '/x/:v[num]', '/x/:s'])
+    expect(routes._.getLocation('/x/3').route).toBe('/x/:n[int]')
+    expect(routes._.getLocation('/x/1.5').route).toBe('/x/:v[num]')
+    expect(routes._.getLocation('/x/foo').route).toBe('/x/:s')
+  })
+
+  it('disjoint typed routes coexist in one collection', () => {
+    const routes = Routes.create({
+      byId: '/item/:id[int]',
+      byUuid: '/item/:id[uuid]',
+      byDate: '/item/:d[date]',
+    })
+    expect(routes._.getLocation('/item/42').route).toBe('/item/:id[int]')
+    expect(routes._.getLocation('/item/123e4567-e89b-12d3-a456-426614174000').route).toBe('/item/:id[uuid]')
+    expect(routes._.getLocation('/item/2026-08-26').route).toBe('/item/:d[date]')
+    expect(routes._.getLocation('/item/nope').route).toBe(undefined)
+  })
+})
+
+describe('param types: type inference', () => {
+  it('infers output and input types per type', () => {
+    const route = Route0.create('/:id[int]/:flag[bool]/:big[bigint]/:u[uuid]/:d[date]/:t[datetime]/:v[num]?')
+    expect(route.definition).toBe('/:id[int]/:flag[bool]/:big[bigint]/:u[uuid]/:d[date]/:t[datetime]/:v[num]?')
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{
+      id: number
+      flag: boolean
+      big: bigint
+      u: string
+      d: Date
+      t: Date
+      v: number | undefined
+    }>()
+    expectTypeOf<typeof route.Infer.ParamsInput>().toEqualTypeOf<{
+      id: number
+      flag: boolean
+      big: bigint
+      u: string
+      d: Date
+      t: Date
+      v?: number | undefined
+    }>()
+  })
+
+  it('keeps [str] identical to a plain param', () => {
+    const explicit = Route0.create('/s/:name[str]')
+    const plain = Route0.create('/s/:name')
+    expect(explicit.getTokens()).toEqual(plain.getTokens())
+    expectTypeOf<typeof explicit.Infer.ParamsOutput>().toEqualTypeOf<typeof plain.Infer.ParamsOutput>()
+    expectTypeOf<typeof explicit.Infer.ParamsInput>().toEqualTypeOf<{ name: string | number }>()
+  })
+
+  it('types the descriptor', () => {
+    const route = Route0.create('/:d[date]/:n[-int]?')
+    expect(route.params).toEqual({ d: { required: true, type: 'date' }, n: { required: false, type: '-int' } })
+    expectTypeOf<typeof route.Infer.ParamsDefinition>().toEqualTypeOf<{
+      d: { required: true; type: 'date' }
+      n: { required: false; type: '-int' }
+    }>()
+  })
+
+  it('string-only form serializes typed params to strings', () => {
+    expectTypeOf<ParamsInputStringOnly<'/:id[int]/:k(a|b)?'>>().toEqualTypeOf<{
+      id: string
+      k?: 'a' | 'b' | undefined
+    }>()
+  })
+})
+
+describe('search declarations: grammar and descriptors', () => {
+  it('parses the full declaration zoo into descriptors', () => {
+    const route = Route0.create('/search&q&page[int]=0&sort(new|top)=new&tags[]&ids[int][]&token!')
+    expect(route.searchParams).toEqual({
+      q: { required: false, array: false, type: 'string' },
+      page: { required: false, array: false, type: 'int', default: 0 },
+      sort: { required: false, array: false, type: 'enum', values: ['new', 'top'], default: 'new' },
+      tags: { required: false, array: true, type: 'string' },
+      ids: { required: false, array: true, type: 'int' },
+      token: { required: true, array: false, type: 'string' },
+    })
+    expect(route.definition).toBe('/search&q&page[int]=0&sort(new|top)=new&tags[]&ids[int][]&token!')
+  })
+
+  it('normalizes the path part only, search stays verbatim', () => {
+    expect(Route0.create('users//x&a&b[]').definition).toBe('/users/x&a&b[]')
+  })
+
+  it('[str] normalizes to the string descriptor in search too', () => {
+    expect(Route0.create('/x&q[str]').searchParams.q).toEqual({ required: false, array: false, type: 'string' })
+  })
+
+  it('a typed default is stored parsed', () => {
+    const def = Route0.create('/x&from[date]=2026-01-01').searchParams.from
+    expect(def.type).toBe('date')
+    expect(def.default).toBeInstanceOf(Date)
+    expect((def.default as Date).getTime()).toBe(Date.UTC(2026, 0, 1))
+    expect(Route0.create('/x&on[bool]=true').searchParams.on.default).toBe(true)
+  })
+
+  it('searchLoose: no declarations at all, or the trailing &', () => {
+    expect(Route0.create('/x').searchLoose).toBe(true)
+    expect(Route0.create('/x&').searchLoose).toBe(true)
+    expect(Route0.create('/x&a').searchLoose).toBe(false)
+    expect(Route0.create('/x&a&').searchLoose).toBe(true)
+    expect(Route0.create('/x&').searchParams).toEqual({})
+  })
+
+  it('rejects malformed declarations with the grammar in the message', () => {
+    expect(() => Route0.create('/x&na-me')).toThrow(/malformed search declaration "&na-me"/)
+    expect(() => Route0.create('/x&q=a=b')).toThrow(/malformed search declaration/)
+    expect(() => Route0.create('/x&q[]!extra')).toThrow(/malformed search declaration/)
+  })
+
+  it('rejects an unknown search param type', () => {
+    expect(() => Route0.create('/x&q[foo]')).toThrow(/unknown search param type "\[foo\]"/)
+  })
+
+  it('rejects the contradictory and pointless modifier combos', () => {
+    expect(() => Route0.create('/x&token!=abc')).toThrow(/combines "!" with a default/)
+    expect(() => Route0.create('/x&tags[]=a')).toThrow(/combines "\[\]" with a default/)
+  })
+
+  it('rejects invalid defaults', () => {
+    expect(() => Route0.create('/x&sort(new|top)=old')).toThrow(/not one of the allowed values/)
+    expect(() => Route0.create('/x&page[int]=1.5')).toThrow(/not a canonical \[int\] value/)
+    expect(() => Route0.create('/x&page[int]=007')).toThrow(/not a canonical \[int\] value/)
+  })
+
+  it('rejects duplicates and stray ampersands', () => {
+    expect(() => Route0.create('/x&q&q[int]')).toThrow(/duplicate search param name "q"/)
+    expect(() => Route0.create('/x&sort(a|a)')).toThrow(/duplicate constraint value/)
+    expect(() => Route0.create('/x&&q')).toThrow(/empty search declaration/)
+    expect(() => Route0.create('/x&q&&')).toThrow(/empty search declaration/)
+  })
+
+  it('a search param may share a name with a path param — different namespaces', () => {
+    const route = Route0.create('/user/:id[int]&id[uuid]')
+    expect(route.params.id).toEqual({ required: true, type: 'int' })
+    expect(route.searchParams.id).toEqual({ required: false, array: false, type: 'uuid' })
+  })
+})
+
+describe('search declarations: building', () => {
+  it('serializes declared keys canonically, best-effort past the types', () => {
+    const route = Route0.create('/search&page[int]&sort(new|top)')
+    expect(route.get({ '?': { page: 2, sort: 'top' } })).toBe('/search?page=2&sort=top')
+    expect(route.get({})).toBe('/search')
+    // @ts-expect-error page is a number at the type level — the canonical string coerces at runtime
+    expect(route.get({ '?': { page: '2' } })).toBe('/search?page=2')
+    expect(route.get({ '?': { page: 1.5 } })).toBe('/search?page=1.5') // emitted; searchSchema rejects it
+    expect(route.searchSchema.safeParse({ page: 1.5 }).success).toBe(false)
+    // @ts-expect-error 'nope' is not a sort value
+    expect(route.get({ '?': { sort: 'nope' } })).toBe('/search?sort=nope')
+  })
+
+  it('never inserts defaults into the URL', () => {
+    const route = Route0.create('/search&page[int]=0')
+    expect(route.get({})).toBe('/search')
+    expect(route.get({ '?': {} })).toBe('/search')
+    expect(route.get({ '?': { page: 0 } })).toBe('/search?page=0') // an explicit value always lands
+  })
+
+  it('a missing required search param drops out of the URL — the schema demands it, get() does not', () => {
+    const route = Route0.create('/cb&token!')
+    expect(route.get({ '?': { token: 'abc' } })).toBe('/cb?token=abc')
+    // @ts-expect-error token is required
+    expect(route.get({})).toBe('/cb')
+    // @ts-expect-error token is required
+    expect(route.get({ '?': {} })).toBe('/cb')
+    expect(route.searchSchema.safeParse({}).success).toBe(false)
+  })
+
+  it('serializes arrays element-wise, wrapping a single value', () => {
+    const route = Route0.create('/f&ids[int][]&tags[]')
+    expect(decodeURIComponent(route.get({ '?': { ids: [1, 2], tags: ['a'] } }))).toBe('/f?ids[]=1&ids[]=2&tags[]=a')
+    expect(decodeURIComponent(route.get({ '?': { ids: [1] } }))).toBe('/f?ids[]=1')
+    expect(decodeURIComponent(route.get({ '?': { ids: [1.5] } }))).toBe('/f?ids[]=1.5') // best-effort
+    expect(route.get({ '?': {} })).toBe('/f') // absent arrays add nothing
+  })
+
+  it('typed values serialize through their canonical form', () => {
+    const route = Route0.create('/e&from[date]&at[datetime]&on[bool]&big[bigint]')
+    const url = route.get(
+      { '?': { from: new Date('2026-08-26'), at: new Date('2026-08-26T10:00:00.000Z'), on: true, big: 2n } },
+      { encode: false },
+    )
+    expect(url).toBe('/e?from=2026-08-26&at=2026-08-26T10:00:00.000Z&on=true&big=2')
+  })
+
+  it('undeclared keys pass through untouched (loose and strict alike at runtime)', () => {
+    expect(Route0.create('/x&page[int]&').get({ '?': { page: 1, extra: 'y' } })).toBe('/x?page=1&extra=y')
+    expect(Route0.create('/x&page[int]').get({ '?': { page: 1, extra: 'y' } as any })).toBe('/x?page=1&extra=y')
+  })
+})
+
+describe('search declarations: searchSchema', () => {
+  const route = Route0.create('/search&q&page[int]=0&sort(new|top)=new&tags[]&ids[int][]')
+
+  it('fills defaults, wraps arrays, keeps plain optionals undefined', () => {
+    expect(route.searchSchema.parse({})).toEqual({
+      q: undefined,
+      page: 0,
+      sort: 'new',
+      tags: [],
+      ids: [],
+    })
+    expect(route.searchSchema.parse(undefined as any)).toEqual({
+      q: undefined,
+      page: 0,
+      sort: 'new',
+      tags: [],
+      ids: [],
+    })
+  })
+
+  it('coerces URL string forms and accepts typed values alike', () => {
+    expect(route.searchSchema.parse({ page: '2', ids: '3' })).toMatchObject({ page: 2, ids: [3] })
+    expect(route.searchSchema.parse({ page: 2, ids: [3, 4] })).toMatchObject({ page: 2, ids: [3, 4] })
+    expect(route.searchSchema.parse({ tags: 'a' })).toMatchObject({ tags: ['a'] })
+    expect(route.searchSchema.safeParse({ page: 'abc' }).success).toBe(false)
+    expect(route.searchSchema.safeParse({ page: '007' }).success).toBe(false)
+    expect(route.searchSchema.safeParse({ ids: ['3', 'x'] }).success).toBe(false)
+    expect(route.searchSchema.safeParse({ sort: 'old' }).success).toBe(false)
+  })
+
+  it('demands required keys', () => {
+    const strict = Route0.create('/cb&token!')
+    expect(strict.searchSchema.parse({ token: 'abc' })).toEqual({ token: 'abc' })
+    expect(strict.searchSchema.safeParse({}).success).toBe(false)
+  })
+
+  it('drops unknown keys in strict mode, keeps them in loose', () => {
+    expect(route.searchSchema.parse({ page: '1', extra: 'x' })).toEqual({
+      q: undefined,
+      page: 1,
+      sort: 'new',
+      tags: [],
+      ids: [],
+    })
+    const loose = Route0.create('/search&page[int]=0&')
+    expect(loose.searchSchema.parse({ page: '1', extra: 'x' })).toEqual({ page: 1, extra: 'x' })
+  })
+
+  it('coerces date and datetime strings', () => {
+    const dated = Route0.create('/e&from[date]&at[datetime]')
+    const parsed = dated.searchSchema.parse({ from: '2026-08-26', at: '2026-08-26T10:00:00Z' })
+    expect((parsed.from as Date).getTime()).toBe(Date.UTC(2026, 7, 26))
+    expect((parsed.at as Date).getTime()).toBe(Date.UTC(2026, 7, 26, 10))
+    expect(dated.searchSchema.safeParse({ from: '2026-13-01' }).success).toBe(false)
+  })
+
+  it('emits JSON Schemas mirroring the coercion', () => {
+    const input = route.searchSchema['~standard'].jsonSchema.input({ target: 'draft-2020-12' }) as Record<string, any>
+    expect(input.properties.page).toEqual({ anyOf: [{ type: 'integer', minimum: 0 }, { type: 'string' }] })
+    expect(input.properties.sort).toEqual({ type: 'string', enum: ['new', 'top'] })
+    expect(input.properties.ids).toEqual({
+      anyOf: [
+        { anyOf: [{ type: 'integer', minimum: 0 }, { type: 'string' }] },
+        { type: 'array', items: { anyOf: [{ type: 'integer', minimum: 0 }, { type: 'string' }] } },
+      ],
+    })
+    expect(input.required).toEqual([])
+    // input mirrors the runtime (unknown keys tolerated: dropped in strict mode, kept in loose)
+    expect(input.additionalProperties).toBe(true)
+    const output = route.searchSchema['~standard'].jsonSchema.output({ target: 'draft-2020-12' }) as Record<string, any>
+    expect(output.properties.page).toEqual({ type: 'integer', minimum: 0 })
+    expect(output.properties.ids).toEqual({ type: 'array', items: { type: 'integer', minimum: 0 } })
+    expect(output.required).toEqual(['page', 'sort', 'tags', 'ids'])
+    expect(output.additionalProperties).toBe(false) // strict output never carries extras — they were dropped
+    const requiredInput = Route0.create('/cb&token!').searchSchema['~standard'].jsonSchema.input({
+      target: 'draft-2020-12',
+    }) as Record<string, any>
+    expect(requiredInput.required).toEqual(['token'])
+    const loose = Route0.create('/x&a&').searchSchema['~standard'].jsonSchema.input({
+      target: 'draft-2020-12',
+    }) as Record<string, any>
+    expect(loose.additionalProperties).toBe(true)
+  })
+})
+
+describe('search declarations: locations and matching', () => {
+  it('matching stays pathname-only', () => {
+    const route = Route0.create('/search&page[int]&token!')
+    expect(route.isExact('/search')).toBe(true)
+    expect(route.isExact('/search?page=abc')).toBe(false) // isExact takes a pathname, not a URL with search
+    expect(route.getRelation('/search?page=abc&token=x').type).toBe('exact')
+    expect(route.getRelation('/search').type).toBe('exact') // even with required search missing — search never matches
+  })
+
+  it('coerceSearch is the lenient view: invalid degrades to the absent case', () => {
+    const route = Route0.create('/search&page[int]=0&ids[int][]&token!')
+    expect(route.coerceSearch({ page: 'abc', ids: ['1', 'x', '2'], extra: 'kept' })).toEqual({
+      page: 0,
+      ids: [1, 2],
+      token: undefined,
+      extra: 'kept',
+    })
+  })
+
+  it('getLocation on a collection coerces the matched route search', () => {
+    const routes = Routes.create({
+      search: '/search&q&page[int]=0&ids[int][]',
+      plain: '/plain',
+    })
+    const loc = routes._.getLocation('/search?q=shoes&page=2&ids=7&extra=x')
+    expect(loc.route).toBe('/search&q&page[int]=0&ids[int][]')
+    expect(loc.search as Record<string, unknown>).toEqual({ q: 'shoes', page: 2, ids: [7], extra: 'x' })
+    const defaulted = routes._.getLocation('/search')
+    expect(defaulted.search as Record<string, unknown>).toEqual({ q: undefined, page: 0, ids: [] })
+    const invalid = routes._.getLocation('/search?page=abc')
+    expect(invalid.search as Record<string, unknown>).toEqual({ q: undefined, page: 0, ids: [] })
+    // a route without declarations keeps the raw parse
+    expect(routes._.getLocation('/plain?x=1').search).toEqual({ x: '1' })
+  })
+})
+
+describe('search declarations: extend and clone', () => {
+  it('concatenates declarations from both sides', () => {
+    const base = Route0.create('/a&x[int]')
+    const extended = base.extend('/b&y(on|off)')
+    expect(extended.definition).toBe('/a/b&x[int]&y(on|off)')
+    expect(extended.searchParams).toEqual({
+      x: { required: false, array: false, type: 'int' },
+      y: { required: false, array: false, type: 'enum', values: ['on', 'off'] },
+    })
+  })
+
+  it('propagates looseness from either side', () => {
+    expect(Route0.create('/a&').extend('/b').definition).toBe('/a/b&')
+    expect(Route0.create('/a').extend('/b&y&').definition).toBe('/a/b&y&')
+    expect(Route0.create('/a&x').extend('/b').definition).toBe('/a/b&x')
+  })
+
+  it('rejects a duplicate search name across the two sides', () => {
+    expect(() => Route0.create('/a&x[int]').extend('/b&x')).toThrow(/duplicate search param name "x"/)
+  })
+
+  it('a trailing wildcard still gives way to the suffix', () => {
+    expect(Route0.create('/files/*&preview[bool]').extend('/meta').definition).toBe('/files/meta&preview[bool]')
+  })
+
+  it('clone keeps the declarations', () => {
+    const route = Route0.create('/search&page[int]=0')
+    expect(route.clone({ origin: 'https://x.dev' }).searchParams.page).toEqual({
+      required: false,
+      array: false,
+      type: 'int',
+      default: 0,
+    })
+  })
+})
+
+describe('search declarations: type inference', () => {
+  it('types the ? object from the declarations', () => {
+    const route = Route0.create('/search&q&page[int]&sort(new|top)&ids[int][]&token!')
+    expect(route.definition).toBe('/search&q&page[int]&sort(new|top)&ids[int][]&token!')
+    expectTypeOf<typeof route.Infer.SearchInput>().toEqualTypeOf<{
+      token: string | number
+      q?: string | number | undefined
+      page?: number | undefined
+      sort?: 'new' | 'top' | undefined
+      ids?: number[] | undefined
+    }>()
+  })
+
+  it('types the search output: required, defaulted and arrays always present', () => {
+    const route = Route0.create('/search&q&page[int]=0&sort(new|top)=new&ids[int][]&token!')
+    expect(route.definition).toContain('&page[int]=0')
+    expectTypeOf<typeof route.Infer.SearchOutput>().toEqualTypeOf<{
+      page: number
+      sort: 'new' | 'top'
+      ids: number[]
+      token: string
+      q: string | undefined
+    }>()
+  })
+
+  it('strict mode rejects undeclared keys at the type level, loose allows them', () => {
+    const strict = Route0.create('/x&page[int]')
+    // @ts-expect-error extra is not declared
+    expect(() => strict.get({ '?': { page: 1, extra: 'y' } })).not.toThrow()
+    const loose = Route0.create('/x&page[int]&')
+    expect(loose.get({ '?': { page: 1, extra: 'y' } })).toBe('/x?page=1&extra=y')
+    const anything = Route0.create('/x')
+    expect(anything.get({ '?': { whatever: 1 } })).toBe('/x?whatever=1')
+  })
+
+  it('a required search param makes get() input non-optional', () => {
+    const route = Route0.create('/cb&token!')
+    expectTypeOf<IsSameParams<typeof route, typeof route>>().toEqualTypeOf<true>()
+    // @ts-expect-error input (with ?.token) is required — at the type level; the runtime just omits it
+    expect(route.get()).toBe('/cb')
+  })
+
+  it('.search<T>() adds keys on top of the declarations', () => {
+    const route = Route0.create('/search&page[int]').search<{ filter?: { min: number } }>()
+    expect(route.get({ '?': { page: 1, filter: { min: 2 } } })).toBe(
+      `/search?page=1&${encodeURIComponent('filter[min]')}=2`,
+    )
+    expectTypeOf<typeof route.Infer.SearchInput>().toEqualTypeOf<{
+      page?: number | undefined
+      filter?: { min: number } | undefined
+    }>()
+  })
+
+  it('.search<T>() rejects a key the definition already declares', () => {
+    const route = Route0.create('/search&page[int]')
+    // @ts-expect-error page is already declared in the definition
+    route.search<{ page?: string }>()
+    expect(route.definition).toBe('/search&page[int]')
+  })
+
+  it('types extended definitions literally', () => {
+    const extended = Route0.create('/a&x[int]').extend('/b&y')
+    expectTypeOf(extended.definition).toEqualTypeOf<'/a/b&x[int]&y'>()
+    const loose = Route0.create('/a&').extend('/b&y')
+    expectTypeOf(loose.definition).toEqualTypeOf<'/a/b&y&'>()
+  })
+})
+
+describe('segment prefix/suffix params: grammar and tokens', () => {
+  it('parses prefix, suffix and both', () => {
+    expect(Route0.create('/x-:id').getTokens()).toEqual([{ kind: 'param', name: 'id', optional: false, prefix: 'x-' }])
+    expect(Route0.create('/:file.mp4').getTokens()).toEqual([
+      { kind: 'param', name: 'file', optional: false, suffix: '.mp4' },
+    ])
+    expect(Route0.create('/img-:id[int].png').getTokens()).toEqual([
+      { kind: 'param', name: 'id', optional: false, type: 'int', prefix: 'img-', suffix: '.png' },
+    ])
+    expect(Route0.create('/v:major[int]').getTokens()).toEqual([
+      { kind: 'param', name: 'major', optional: false, type: 'int', prefix: 'v' },
+    ])
+  })
+
+  it('a suffix must start with a non-name character — letters glue to the name', () => {
+    expect(Route0.create('/:idpng').getTokens()).toEqual([{ kind: 'param', name: 'idpng', optional: false }])
+  })
+
+  it('supports enums with affixes', () => {
+    expect(Route0.create('/report-:kind(daily|weekly).pdf').getTokens()).toEqual([
+      { kind: 'param', name: 'kind', optional: false, values: ['daily', 'weekly'], prefix: 'report-', suffix: '.pdf' },
+    ])
+  })
+
+  it('at most two params per segment — a third ":" or a glued pair is malformed', () => {
+    // `:from-:to` graduated into a legal tail param (see the tail-param describe blocks)
+    expect(() => Route0.create('/:a.:b.:c')).toThrow(/malformed param segment/)
+    expect(() => Route0.create('/a::b')).toThrow(/malformed param segment/)
+    expect(() => Route0.create('/:a:b')).toThrow(/malformed param segment/) // no delimiter between the two
+  })
+
+  it('a ":" anywhere in a non-wildcard segment means param intent, never a silent static', () => {
+    expect(() => Route0.create('/api/v1:')).toThrow(/malformed param segment/)
+    expect(Route0.create('/api/v1:beta').getTokens()).toEqual([
+      { kind: 'static', value: 'api' },
+      { kind: 'param', name: 'beta', optional: false, prefix: 'v1' },
+    ])
+  })
+
+  it('the descriptor stays affix-free — affixes are segment furniture, not param contract', () => {
+    expect(Route0.create('/img-:id[int].png').params).toEqual({ id: { required: true, type: 'int' } })
+  })
+
+  it('a prefixed wildcard still wins over the param reading', () => {
+    expect(Route0.create('/:id*').getTokens()).toEqual([{ kind: 'wildcard', prefix: ':id', optional: false }])
+  })
+})
+
+describe('segment prefix/suffix params: matching, parsing, building', () => {
+  it('matches only with the literal affixes in place', () => {
+    const route = Route0.create('/img-:id[int].png')
+    expect(route.isExact('/img-42.png')).toBe(true)
+    expect(route.isExact('/img-42.jpg')).toBe(false)
+    expect(route.isExact('/42.png')).toBe(false)
+    expect(route.isExact('/img-.png')).toBe(false) // empty value
+    expect(route.isExact('/img-4.5.png')).toBe(false) // not an int
+    expect(route.getRelation('/img-42.png').params).toEqual({ id: 42 })
+  })
+
+  it('greedy body keeps the round-trip stable when the value contains the suffix', () => {
+    const route = Route0.create('/:file.mp4')
+    expect(route.getRelation('/a.mp4.mp4').params).toEqual({ file: 'a.mp4' })
+    expect(route.get({ file: 'a.mp4' })).toBe('/a.mp4.mp4')
+  })
+
+  it('builds with affixes around the encoded value', () => {
+    const route = Route0.create('/img-:id[int].png')
+    expect(route.get({ id: 42 })).toBe('/img-42.png')
+    expect(route.get({ id: 1.5 })).toBe('/img-1.5.png') // best-effort — matches nothing
+    const file = Route0.create('/f-:name')
+    expect(file.get({ name: 'a b' })).toBe('/f-a%20b')
+  })
+
+  it('an optional affixed param drops the whole segment', () => {
+    const route = Route0.create('/files/page-:n[int]?')
+    expect(route.get({})).toBe('/files')
+    expect(route.get({ n: 2 })).toBe('/files/page-2')
+    expect(route.isExact('/files')).toBe(true)
+    expect(route.isExact('/files/page-2')).toBe(true)
+    expect(route.isExact('/files/page-')).toBe(false)
+    expect(route.getRelation('/files').params).toEqual({ n: undefined })
+    expect(route.getRelation('/files/page-7').params).toEqual({ n: 7 })
+  })
+
+  it('typed affixed params parse to their typed values everywhere', () => {
+    const route = Route0.create('/v:major[int]/report-:kind(daily|weekly).pdf')
+    expect(route.getRelation('/v2/report-daily.pdf').params).toEqual({ major: 2, kind: 'daily' })
+    expect(route.getRelation('/v2').params).toEqual({ major: 2 }) // descendant relation
+    expect(route.get({ major: 2, kind: 'weekly' })).toBe('/v2/report-weekly.pdf')
+  })
+})
+
+describe('segment prefix/suffix params: specificity and overlap', () => {
+  it('disjoint affixes coexist freely', () => {
+    expect(Route0.create('/a-:x').isOverlap('/b-:y')).toBe(false)
+    expect(Route0.create('/a-:x').isConflict('/b-:y')).toBe(false)
+    expect(Route0.create('/:x.png').isOverlap('/:y.jpg')).toBe(false)
+  })
+
+  it('identical affixes with the same body are a real conflict', () => {
+    expect(Route0.create('/a-:x').isConflict('/a-:y')).toBe(true)
+    expect(Route0.create('/a-:x[int]').isConflict('/a-:y[bigint]')).toBe(true)
+  })
+
+  it('an affixed param outranks a bare one, a static still outranks both', () => {
+    expect(Route0.create('/x/a-:id').isMoreSpecificThan('/x/:all')).toBe(true)
+    expect(Route0.create('/x/static').isMoreSpecificThan('/x/a-:id')).toBe(true)
+    expect(Route0.create('/x/:k(a|b)').isMoreSpecificThan('/x/a-:id')).toBe(true)
+  })
+
+  it('nesting affixes resolve by ordering: more literal text first', () => {
+    // 'abXXX' matches both /ab:x and /a:y (y = 'bXXX') — real overlap, resolvable by trying the longer prefix first
+    expect(Route0.create('/ab:x').isOverlap('/a:y')).toBe(true)
+    expect(Route0.create('/ab:x').isConflict('/a:y')).toBe(false)
+    expect(Route0.create('/ab:x').isMoreSpecificThan('/a:y')).toBe(true)
+    // 'ab-' and 'a-' do NOT nest (second char 'b' vs '-') — these are simply disjoint
+    expect(Route0.create('/ab-:x').isOverlap('/a-:y')).toBe(false)
+  })
+
+  it('a static segment meets an affixed param only when it fits the shape', () => {
+    expect(Route0.create('/x/img-42.png').isOverlap('/x/img-:id[int].png')).toBe(true)
+    expect(Route0.create('/x/img-ab.png').isOverlap('/x/img-:id[int].png')).toBe(false)
+    expect(Route0.create('/x/img-42.jpg').isOverlap('/x/img-:id[int].png')).toBe(false)
+  })
+
+  it('routes a URL to the right affixed route in a collection', () => {
+    const routes = Routes.create({
+      image: '/files/img-:id[int].png',
+      video: '/files/:name.mp4',
+      any: '/files/:name',
+    })
+    expect(routes._.getLocation('/files/img-7.png').route).toBe('/files/img-:id[int].png')
+    expect(routes._.getLocation('/files/talk.mp4').route).toBe('/files/:name.mp4')
+    expect(routes._.getLocation('/files/readme.txt').route).toBe('/files/:name')
+    expect(routes._.getLocation('/files/img-7.png').params).toEqual({ id: 7 })
+  })
+})
+
+describe('segment prefix/suffix params: type inference', () => {
+  it('infers the params from affixed segments', () => {
+    const route = Route0.create('/v:major[int]/img-:id[bigint].png/:file.mp4/page-:n[int]?')
+    expect(route.definition).toBe('/v:major[int]/img-:id[bigint].png/:file.mp4/page-:n[int]?')
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{
+      major: number
+      id: bigint
+      file: string
+      n: number | undefined
+    }>()
+    expectTypeOf<typeof route.Infer.ParamsDefinition>().toEqualTypeOf<{
+      major: { required: true; type: 'int' }
+      id: { required: true; type: 'bigint' }
+      file: { required: true; type: 'string' }
+      n: { required: false; type: 'int' }
+    }>()
+  })
+
+  it('infers enum values through affixes', () => {
+    const route = Route0.create('/report-:kind(daily|weekly).pdf')
+    expect(route.get({ kind: 'daily' })).toBe('/report-daily.pdf')
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{ kind: 'daily' | 'weekly' }>()
+    // @ts-expect-error 'monthly' is not a kind
+    expect(route.get({ kind: 'monthly' })).toBe('/report-monthly.pdf')
+  })
+
+  it('name scanning stops at the first non-name character', () => {
+    const route = Route0.create('/:my_id-v2')
+    expect(route.get({ my_id: 'a' })).toBe('/a-v2')
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{ my_id: string }>()
+  })
+
+  it('plays together with search declarations', () => {
+    const route = Route0.create('/img-:id[int].png&w[int]&h[int]')
+    expect(route.get({ id: 1, '?': { w: 100 } })).toBe('/img-1.png?w=100')
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{ id: number }>()
+    expectTypeOf<typeof route.Infer.SearchInput>().toEqualTypeOf<{
+      w?: number | undefined
+      h?: number | undefined
+    }>()
+  })
+})
+
+describe('advisor-review fixes', () => {
+  it('equal affixes with disjoint types coexist (the language matrix applies through affixes)', () => {
+    expect(Route0.create('/f-:a[int]').isOverlap('/f-:b[uuid]')).toBe(false)
+    expect(Route0.create('/f-:a[int]').isConflict('/f-:b[uuid]')).toBe(false)
+    expect(Route0.create('/img-:id[int].png').isConflict('/img-:d[date].png')).toBe(false)
+    // ...while equal affixes with nested types still resolve by ordering, and equal languages still conflict
+    expect(Route0.create('/f-:a[int]').isConflict('/f-:b[num]')).toBe(false)
+    expect(Route0.create('/f-:a[int]').isConflict('/f-:b[bigint]')).toBe(true)
+    const routes = Routes.create({
+      byId: '/item/i-:id[int]',
+      byUuid: '/item/i-:id[uuid]',
+    })
+    expect(routes._.getLocation('/item/i-42').route).toBe('/item/i-:id[int]')
+    expect(routes._.getLocation('/item/i-123e4567-e89b-12d3-a456-426614174000').route).toBe('/item/i-:id[uuid]')
+  })
+
+  it('a param cannot share a segment with a wildcard — no silent literal-prefix wildcard', () => {
+    expect(() => Route0.create('/a-:id[int]*')).toThrow(/param cannot share a segment with a wildcard/)
+    expect(() => Route0.create('/a-:id*')).toThrow(/param cannot share a segment with a wildcard/)
+    expect(() => Route0.create('/x:pre*')).toThrow(/param cannot share a segment with a wildcard/)
+    // the legacy `:prefix*` spelling survives: leading `:` is the wildcard's own literal prefix
+    expect(Route0.create('/:id*').getTokens()).toEqual([{ kind: 'wildcard', prefix: ':id', optional: false }])
+  })
+
+  it('an empty string for a param degrades to the literal "undefined" — never a collapsed segment', () => {
+    const route = Route0.create('/u/:name')
+    // emitting '' would collapse the segment and let the SHORTER path exact-match a sibling route
+    expect(route.get({ name: '' })).toBe('/u/undefined')
+    expect(route.schema.safeParse({ name: '' }).success).toBe(false)
+    expect(route.get({ name: 'a' })).toBe('/u/a')
+    // the cross-route misroute this prevents:
+    const dirs = Route0.create('/files/:dir/:file')
+    const flat = Route0.create('/files/:name')
+    expect(dirs.get({ dir: '', file: 'x' })).toBe('/files/undefined/x')
+    expect(flat.isExact(dirs.get({ dir: '', file: 'x' }))).toBe(false)
+    // an empty OPTIONAL param counts as absent
+    expect(Route0.create('/u/:name?').get({ name: '' })).toBe('/u')
+  })
+
+  it('a malformed percent-sequence parses to the raw value instead of throwing', () => {
+    const route = Route0.create('/u/:name')
+    expect(route.isExact('/u/%GG')).toBe(true) // the regex is the matching authority
+    expect(route.getRelation('/u/%GG').params).toEqual({ name: '%GG' })
+  })
+})
+
+describe('tail params: grammar and tokens', () => {
+  it('parses a two-param segment into a token with a tail', () => {
+    expect(Route0.create('/my/:slug.:ext').getTokens()).toEqual([
+      { kind: 'static', value: 'my' },
+      { kind: 'param', name: 'slug', optional: false, tail: { name: 'ext', optional: false, delimiter: '.' } },
+    ])
+    expect(Route0.create('/range/:from-:to').getTokens()).toEqual([
+      { kind: 'static', value: 'range' },
+      { kind: 'param', name: 'from', optional: false, tail: { name: 'to', optional: false, delimiter: '-' } },
+    ])
+  })
+
+  it('the trailing ? on a two-param segment marks the TAIL optional, not the segment', () => {
+    expect(Route0.create('/my/:slug.:ext?').getTokens()).toEqual([
+      { kind: 'static', value: 'my' },
+      { kind: 'param', name: 'slug', optional: false, tail: { name: 'ext', optional: true, delimiter: '.' } },
+    ])
+  })
+
+  it('tails carry enums, types, and combine with a literal prefix', () => {
+    expect(Route0.create('/r/:name.:ext(md|txt)?').getTokens()[1]).toEqual({
+      kind: 'param',
+      name: 'name',
+      optional: false,
+      tail: { name: 'ext', optional: true, delimiter: '.', values: ['md', 'txt'] },
+    })
+    expect(Route0.create('/v:maj[int].:min[int]').getTokens()[0]).toEqual({
+      kind: 'param',
+      name: 'maj',
+      optional: false,
+      type: 'int',
+      prefix: 'v',
+      tail: { name: 'min', optional: false, delimiter: '.', type: 'int' },
+    })
+  })
+
+  it('both params get full descriptors', () => {
+    expect(Route0.create('/my/:slug.:ext?').params).toEqual({
+      slug: { required: true, type: 'string' },
+      ext: { required: false, type: 'string' },
+    })
+    expect(Route0.create('/v:maj[int].:min[int]').params).toEqual({
+      maj: { required: true, type: 'int' },
+      min: { required: true, type: 'int' },
+    })
+  })
+
+  it('rejects a tail whose language contains its own delimiter', () => {
+    expect(() => Route0.create('/x/:a-:d[date]')).toThrow(/tail type \[date\].*can contain the delimiter "-"/)
+    expect(() => Route0.create('/x/:f.:v[num]')).toThrow(/tail type \[num\].*can contain the delimiter "\."/)
+    expect(() => Route0.create('/x/:s.:e(m.d|txt)')).toThrow(/tail value.*contains the delimiter/)
+    expect(() => Route0.create('/x/:a-:b[int]')).not.toThrow() // int has no '-'
+    expect(() => Route0.create('/x/:a~:b[uuid]')).not.toThrow() // '~' appears in no type
+  })
+
+  it('rejects an optional tail when the FIRST language can contain the delimiter', () => {
+    expect(() => Route0.create('/x/:v[num].:ext?')).toThrow(/first param's values can contain the delimiter/)
+    expect(() => Route0.create('/x/:k(a.b|c).:ext?')).toThrow(/first param's values can contain the delimiter/)
+    expect(() => Route0.create('/x/:v[num].:ext')).not.toThrow() // required tail is unambiguous
+    expect(() => Route0.create('/x/:k(a.b|c).:ext')).not.toThrow()
+    expect(() => Route0.create('/x/:v[int].:ext?')).not.toThrow() // int can't contain '.'
+  })
+
+  it('rejects duplicate names across first and tail', () => {
+    expect(() => Route0.create('/x/:id.:id')).toThrow(/duplicate param name "id"/)
+    expect(() => Route0.create('/x/:id/y/:a.:id')).toThrow(/duplicate param name "id"/)
+  })
+})
+
+describe('tail params: matching, parsing, building', () => {
+  it('splits at the LAST delimiter — the tail can never contain it', () => {
+    const route = Route0.create('/my/:slug.:ext')
+    expect(route.getRelation('/my/talk.md').params).toEqual({ slug: 'talk', ext: 'md' })
+    expect(route.getRelation('/my/a.b.md').params).toEqual({ slug: 'a.b', ext: 'md' })
+    expect(route.isExact('/my/talk')).toBe(false) // the tail is required
+    expect(route.get({ slug: 'a.b', ext: 'md' })).toBe('/my/a.b.md')
+    // full round-trip through the ambiguous-looking value
+    expect(route.getRelation(route.get({ slug: 'a.md', ext: 'md' })).params).toEqual({ slug: 'a.md', ext: 'md' })
+  })
+
+  it('an optional tail drops the delimiter with it, matching prefers the tail', () => {
+    const route = Route0.create('/my/:slug.:ext?')
+    expect(route.getRelation('/my/talk.md').params).toEqual({ slug: 'talk', ext: 'md' })
+    expect(route.getRelation('/my/talk').params).toEqual({ slug: 'talk', ext: undefined })
+    expect(route.getRelation('/my/a.b.md').params).toEqual({ slug: 'a.b', ext: 'md' })
+    expect(route.get({ slug: 'talk' })).toBe('/my/talk')
+    expect(route.get({ slug: 'talk', ext: 'md' })).toBe('/my/talk.md')
+  })
+
+  it('the bijection guard lives in the schema: an ambiguous omitted tail is a validation error, not a throw', () => {
+    const route = Route0.create('/my/:slug.:ext?')
+    expect(route.get({ slug: 'a.md' })).toBe('/my/a.md') // emitted (re-parses as slug 'a' + ext 'md')
+    expect(route.get({ slug: 'a.md', ext: 'txt' })).toBe('/my/a.md.txt') // providing the tail disambiguates
+    expect(route.schema.safeParse({ slug: 'a.md' }).success).toBe(false) // the schema flags the ambiguity
+    expect(route.schema.parse({ slug: 'talk' })).toEqual({ slug: 'talk', ext: undefined })
+    // a trailing delimiter alone is not a valid tail, so it round-trips freely
+    expect(route.get({ slug: 'a.' })).toBe('/my/a.')
+    expect(route.getRelation('/my/a.').params).toEqual({ slug: 'a.', ext: undefined })
+  })
+
+  it('an enum tail only claims its own values — everything else stays in the body', () => {
+    const route = Route0.create('/r/:name.:ext(md|txt)?')
+    expect(route.getRelation('/r/a.md').params).toEqual({ name: 'a', ext: 'md' })
+    expect(route.getRelation('/r/a.pdf').params).toEqual({ name: 'a.pdf', ext: undefined })
+    expect(route.get({ name: 'a.pdf' })).toBe('/r/a.pdf') // round-trips freely: '.pdf' is no valid tail
+    expect(route.schema.safeParse({ name: 'a.md' }).success).toBe(false) // '.md' would re-parse — schema flags it
+    // @ts-expect-error 'pdf' is not an ext value — emitted as-is, the URL just parses back differently
+    expect(route.get({ name: 'a', ext: 'pdf' })).toBe('/r/a.pdf')
+  })
+
+  it('typed tails parse to typed values, both directions', () => {
+    const route = Route0.create('/v:maj[int].:min[int]')
+    expect(route.getRelation('/v2.7').params).toEqual({ maj: 2, min: 7 })
+    expect(route.get({ maj: 2, min: 7 })).toBe('/v2.7')
+    expect(route.isExact('/v2.x')).toBe(false)
+    expect(route.isExact('/v2')).toBe(false)
+    expect(route.get({ maj: 2, min: 1.5 })).toBe('/v2.1.5') // best-effort — matches nothing
+    expect(route.schema.safeParse({ maj: 2, min: 1.5 }).success).toBe(false)
+    expect(route.schema.parse({ maj: 2, min: 7 })).toEqual({ maj: 2, min: 7 })
+  })
+
+  it('a dash-delimited range keeps the tail dash-free', () => {
+    const route = Route0.create('/range/:from-:to')
+    expect(route.getRelation('/range/a-b-c').params).toEqual({ from: 'a-b', to: 'c' })
+    expect(route.get({ from: 'a-b', to: 'c' })).toBe('/range/a-b-c')
+    // the first value may contain the delimiter freely; a TAIL value may not — it would shift the split on re-parse
+    expect(route.getRelation(route.get({ from: '2026-01', to: '08' })).params).toEqual({ from: '2026-01', to: '08' })
+    // a tail value containing its delimiter emits best-effort (and would re-parse shifted) — the schema rejects it
+    expect(route.get({ from: '2026-01', to: '2026-08' })).toBe('/range/2026-01-2026-08')
+    expect(route.schema.safeParse({ from: '2026-01', to: '2026-08' }).success).toBe(false)
+    expect(route.schema.safeParse({ from: '2026-01', to: '08' }).success).toBe(true)
+  })
+
+  it('missing required parts emit the literal "undefined" in their spot', () => {
+    const route = Route0.create('/my/:slug.:ext')
+    // @ts-expect-error ext is required
+    expect(route.get({ slug: 'a' })).toBe('/my/a.undefined')
+    // @ts-expect-error slug is required
+    expect(route.get({ ext: 'md' })).toBe('/my/undefined.md')
+    expect(route.get({ slug: 'a', ext: '' })).toBe('/my/a.undefined') // an empty tail counts as absent-required
+    expect(route.schema.safeParse({ slug: 'a' }).success).toBe(false) // the schema still demands both
+  })
+})
+
+describe('wildcard tails', () => {
+  it('a literal suffix after the star demands a non-empty body ending with it', () => {
+    const route = Route0.create('/docs/*.md')
+    expect(route.isExact('/docs/readme.md')).toBe(true)
+    expect(route.isExact('/docs/a/b/c.md')).toBe(true)
+    expect(route.isExact('/docs/readme.txt')).toBe(false)
+    expect(route.isExact('/docs/.md')).toBe(false) // empty body
+    expect(route.isExact('/docs')).toBe(false)
+    expect(route.getRelation('/docs/a/b/c.md').params).toEqual({ '*': 'a/b/c' })
+    expect(route.get({ '*': 'a/b/c' })).toBe('/docs/a/b/c.md')
+    // round-trip through a value that itself ends in the suffix
+    expect(route.getRelation(route.get({ '*': 'x.md' })).params).toEqual({ '*': 'x.md' })
+    // @ts-expect-error the wildcard body is required for a suffixed wildcard — emitted empty, matches nothing
+    expect(route.get({})).toBe('/docs/.md')
+    expect(route.get({ '*': '' })).toBe('/docs/.md')
+    expect(route.isExact('/docs/.md')).toBe(false)
+  })
+
+  it('a tail param on the star pulls the extension out of the LAST segment only', () => {
+    const route = Route0.create('/raw/*.:ext')
+    expect(route.getRelation('/raw/a/b.md').params).toEqual({ '*': 'a/b', ext: 'md' })
+    expect(route.getRelation('/raw/x.y.md').params).toEqual({ '*': 'x.y', ext: 'md' })
+    expect(route.isExact('/raw/a.b/c')).toBe(false) // no extension in the last segment
+    expect(route.get({ '*': 'a/b', ext: 'md' })).toBe('/raw/a/b.md')
+    expect(Route0.create('/raw/*.:v[int]').getRelation('/raw/x.7').params).toEqual({ '*': 'x', v: 7 })
+  })
+
+  it('an optional wildcard tail behaves like the param one, guard included', () => {
+    const route = Route0.create('/raw/*.:ext?')
+    expect(route.getRelation('/raw/a/b').params).toEqual({ '*': 'a/b', ext: undefined })
+    expect(route.getRelation('/raw/a/b.md').params).toEqual({ '*': 'a/b', ext: 'md' })
+    expect(route.get({ '*': 'a/b' })).toBe('/raw/a/b')
+    expect(route.get({ '*': 'a/b.c' })).toBe('/raw/a/b.c') // emitted; re-parses with ext 'c' — schema flags it
+    expect(route.schema.safeParse({ '*': 'a/b.c' }).success).toBe(false)
+    expect(route.get({ '*': 'a/b.c', ext: 'md' })).toBe('/raw/a/b.c.md')
+    expect(route.getRelation('/raw/a/b.c.md').params).toEqual({ '*': 'a/b.c', ext: 'md' })
+  })
+
+  it('rejects the meaningless wildcard forms', () => {
+    expect(() => Route0.create('/x/*?.md')).toThrow(/malformed wildcard segment/)
+    expect(() => Route0.create('/x/*.md?')).toThrow(/malformed wildcard segment/)
+    expect(() => Route0.create('/x/*.:ext/more')).toThrow(/allowed only at the end/)
+    expect(() => Route0.create('/x/*.:e(m.d)')).toThrow(/tail value.*contains the delimiter/)
+    expect(() => Route0.create('/x/:ext/*.:ext')).toThrow(/duplicate param name "ext"/)
+  })
+
+  it('extending past a suffixed wildcard is rejected rather than silently mangled', () => {
+    expect(() => Route0.create('/docs/*.md').extend('/meta')).toThrow(/allowed only at the end/)
+  })
+})
+
+describe('tail params: specificity, overlap and ordering', () => {
+  it('more literal text is narrower: suffix > tail > bare, for params and wildcards alike', () => {
+    expect(Route0.create('/x/:s.md').isMoreSpecificThan('/x/:a.:b')).toBe(true)
+    expect(Route0.create('/x/:a.:b').isMoreSpecificThan('/x/:name')).toBe(true)
+    expect(Route0.create('/docs/*.md').isMoreSpecificThan('/docs/*.:ext')).toBe(true)
+    expect(Route0.create('/docs/*.:ext').isMoreSpecificThan('/docs/*')).toBe(true)
+  })
+
+  it('same-shape tailed segments conflict, different-shape ones resolve or stay apart', () => {
+    expect(Route0.create('/x/:a.:b').isConflict('/x/:c.:d')).toBe(true) // identical language
+    expect(Route0.create('/x/:a.:b').isConflict('/x/:c-:d')).toBe(true) // crossing: both match 'a.b-c'
+    expect(Route0.create('/x/:a.:b').isConflict('/x/:s.md')).toBe(false) // ordering: suffix first
+    expect(Route0.create('/docs/*.md').isConflict('/docs/*')).toBe(false) // ordering: suffixed first
+    expect(Route0.create('/docs/*.md').isConflict('/docs/*.:ext')).toBe(false)
+  })
+
+  it('routes a URL through the whole zoo deterministically, insertion-order independent', () => {
+    const record = {
+      st: '/x/static',
+      en: '/x/:e(a|b)',
+      img: '/x/img-:i[int].png',
+      vn: '/x/v:n[int]',
+      ti: '/x/:t[int]',
+      tn: '/x/:t2[num]',
+      sfx: '/x/:s.md',
+      pfx: '/x/f-:p',
+      tail: '/x/:a.:b',
+      plain: '/x/:plain',
+      eno: '/x/:o(q|w)?',
+      tio: '/x/:ot[int]?',
+      po: '/x/:op?',
+      wsfx: '/x/*.md',
+      wtail: '/x/*.:ext',
+      w: '/x/*',
+    }
+    const expectedOrdering = [
+      '/x/static',
+      '/x/:e(a|b)',
+      '/x/img-:i[int].png',
+      '/x/v:n[int]',
+      '/x/:t[int]',
+      '/x/:t2[num]',
+      '/x/:s.md',
+      '/x/f-:p',
+      '/x/:a.:b',
+      '/x/:plain',
+      '/x/:o(q|w)?',
+      '/x/:ot[int]?',
+      '/x/:op?',
+      '/x/*.md',
+      '/x/*.:ext',
+      '/x/*',
+    ]
+    const routes = Routes.create(record)
+    expect(routes._.pathsOrdering).toEqual(expectedOrdering)
+    // the same set inserted in reverse produces the same total order
+    const reversed = Routes.create(Object.fromEntries(Object.entries(record).reverse()))
+    expect(reversed._.pathsOrdering).toEqual(expectedOrdering)
+
+    const probes: Array<[url: string, route: string]> = [
+      ['/x/static', '/x/static'],
+      ['/x/a', '/x/:e(a|b)'],
+      ['/x/img-5.png', '/x/img-:i[int].png'],
+      ['/x/v7', '/x/v:n[int]'],
+      ['/x/9', '/x/:t[int]'],
+      ['/x/9.5', '/x/:t2[num]'],
+      ['/x/doc.md', '/x/:s.md'],
+      ['/x/f-q', '/x/f-:p'],
+      ['/x/a.txt', '/x/:a.:b'],
+      ['/x/word', '/x/:plain'],
+      ['/x/a/b.md', '/x/*.md'],
+      ['/x/a/b.txt', '/x/*.:ext'],
+      ['/x/a/plain', '/x/*'],
+    ]
+    for (const [url, definition] of probes) {
+      expect(routes._.getLocation(url).route).toBe(definition)
+    }
+  })
+})
+
+describe('tail params: type inference', () => {
+  it('infers both params of a segment, optionality on the tail only', () => {
+    const route = Route0.create('/my/:slug.:ext?')
+    expect(route.definition).toBe('/my/:slug.:ext?')
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{ slug: string; ext: string | undefined }>()
+    expectTypeOf<typeof route.Infer.ParamsInput>().toEqualTypeOf<{
+      slug: string | number
+      ext?: string | number | undefined
+    }>()
+    expectTypeOf<IsParamsOptional<typeof route>>().toEqualTypeOf<false>() // slug is still required
+  })
+
+  it('infers typed and enum tails through prefixes', () => {
+    const versioned = Route0.create('/v:maj[int].:min[int]')
+    expect(versioned.definition).toBe('/v:maj[int].:min[int]')
+    expectTypeOf<typeof versioned.Infer.ParamsOutput>().toEqualTypeOf<{ maj: number; min: number }>()
+    expectTypeOf<typeof versioned.Infer.ParamsDefinition>().toEqualTypeOf<{
+      maj: { required: true; type: 'int' }
+      min: { required: true; type: 'int' }
+    }>()
+    const report = Route0.create('/r/:name.:ext(md|txt)?')
+    expect(report.definition).toBe('/r/:name.:ext(md|txt)?')
+    expectTypeOf<typeof report.Infer.ParamsOutput>().toEqualTypeOf<{
+      name: string
+      ext: 'md' | 'txt' | undefined
+    }>()
+    const range = Route0.create('/range/:from-:to')
+    expect(range.definition).toBe('/range/:from-:to')
+    expectTypeOf<typeof range.Infer.ParamsOutput>().toEqualTypeOf<{ from: string; to: string }>()
+  })
+
+  it('infers wildcard tails', () => {
+    const suffixed = Route0.create('/docs/*.md')
+    expect(suffixed.get({ '*': 'a' })).toBe('/docs/a.md')
+    expectTypeOf<typeof suffixed.Infer.ParamsOutput>().toEqualTypeOf<{ '*': string }>()
+    const tailed = Route0.create('/raw/*.:ext[int]')
+    expect(tailed.get({ '*': 'a', ext: 7 })).toBe('/raw/a.7')
+    expectTypeOf<typeof tailed.Infer.ParamsOutput>().toEqualTypeOf<{ '*': string; ext: number }>()
+    const optionalTail = Route0.create('/raw/*.:ext?')
+    expect(optionalTail.get({ '*': 'a' })).toBe('/raw/a')
+    expectTypeOf<typeof optionalTail.Infer.ParamsOutput>().toEqualTypeOf<{ '*': string; ext: string | undefined }>()
+  })
+
+  it('tails compose with search declarations and extend()', () => {
+    const route = Route0.create('/f/:name.:ext(md|txt)&dl[bool]')
+    expect(route.get({ name: 'a', ext: 'md', '?': { dl: true } })).toBe('/f/a.md?dl=true')
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{ name: string; ext: 'md' | 'txt' }>()
+    expectTypeOf<typeof route.Infer.SearchInput>().toEqualTypeOf<{ dl?: boolean | undefined }>()
+    const extended = Route0.create('/a').extend('/:s.:e?')
+    expect(extended.definition).toBe('/a/:s.:e?')
+    expectTypeOf(extended.definition).toEqualTypeOf<'/a/:s.:e?'>()
+    expectTypeOf<typeof extended.Infer.ParamsOutput>().toEqualTypeOf<{ s: string; e: string | undefined }>()
+  })
+
+  it('get() rejects wrong tail types at compile time, coercing canonical strings at runtime', () => {
+    const route = Route0.create('/v:maj[int].:min[int]')
+    // @ts-expect-error min is a number at the type level
+    expect(route.get({ maj: 1, min: '7' })).toBe('/v1.7')
+    // @ts-expect-error maj is a number at the type level
+    expect(route.get({ maj: '1', min: 7 })).toBe('/v1.7')
+  })
+})
+
+describe('tail params: encoded-delimiter smuggling and other corners', () => {
+  it('a percent-encoded delimiter cannot smuggle itself into a plain tail', () => {
+    const route = Route0.create('/my/:slug.:ext')
+    // '/my/a.%2Emd' would decode ext to '.md' — a value get() could never rebuild — so it must not match at all
+    expect(route.isExact('/my/a.%2Emd')).toBe(false)
+    expect(route.isExact('/my/a.%2emd')).toBe(false)
+    expect(route.isExact('/my/a.md')).toBe(true)
+    expect(route.isExact('/my/a.m%20d')).toBe(true) // other encodings in the tail stay legal
+    expect(route.getRelation('/my/a.m%20d').params).toEqual({ slug: 'a', ext: 'm d' })
+    const range = Route0.create('/range/:from-:to')
+    expect(range.isExact('/range/a-b%2Dc')).toBe(false)
+    expect(range.isExact('/range/a-bc')).toBe(true)
+  })
+
+  it('encoded values round-trip through both body and tail', () => {
+    const route = Route0.create('/my/:slug.:ext?')
+    expect(route.get({ slug: 'a b', ext: 'c d' })).toBe('/my/a%20b.c%20d')
+    expect(route.getRelation('/my/a%20b.c%20d').params).toEqual({ slug: 'a b', ext: 'c d' })
+    expect(route.get({ slug: 'a b' }, { encode: false })).toBe('/my/a b')
+  })
+
+  it('ancestor and descendant relations extract tail params too', () => {
+    const route = Route0.create('/my/:slug.:ext')
+    expect(route.getRelation('/my/talk.md/deep').params).toEqual({ slug: 'talk', ext: 'md' })
+    const deep = Route0.create('/my/:slug.:ext/comments')
+    const relation = deep.getRelation('/my/talk.md')
+    expect(relation.type).toBe('descendant')
+    expect(relation.params).toEqual({ slug: 'talk', ext: 'md' })
+  })
+
+  it('exotic-but-legal tail types: uuid after a dot, datetime after a tilde', () => {
+    const byUuid = Route0.create('/n/:name.:id[uuid]')
+    expect(byUuid.getRelation('/n/joe.123e4567-e89b-12d3-a456-426614174000').params).toEqual({
+      name: 'joe',
+      id: '123e4567-e89b-12d3-a456-426614174000',
+    })
+    const stamped = Route0.create('/s/:name~:at[datetime]') // datetime uses '.' and '-', so only '~' can delimit it
+    const at = new Date('2026-08-26T10:00:00.000Z')
+    expect(stamped.get({ name: 'run', at }, { encode: false })).toBe('/s/run~2026-08-26T10:00:00.000Z')
+    expect((stamped.getRelation('/s/run~2026-08-26T10%3A00%3A00.000Z').params as { at: Date }).at.getTime()).toBe(
+      at.getTime(),
+    )
+  })
+
+  it('abs() and hash compose with tails', () => {
+    const route = Route0.create('/my/:slug.:ext?', { origin: 'https://x.dev' })
+    expect(route.abs({ slug: 'talk', ext: 'md', '#': 'top' })).toBe('https://x.dev/my/talk.md#top')
+  })
+})
+
+describe('type utilities across the whole grammar', () => {
+  it('HasParams / HasWildcard / IsParamsOptional see through tails', () => {
+    expectTypeOf<HasParams<'/docs/*.md'>>().toEqualTypeOf<true>()
+    expectTypeOf<HasWildcard<'/docs/*.md'>>().toEqualTypeOf<true>()
+    expectTypeOf<HasWildcard<'/my/:slug.:ext'>>().toEqualTypeOf<false>()
+    expectTypeOf<IsParamsOptional<'/raw/*.:ext?'>>().toEqualTypeOf<false>() // '*' stays required
+    expectTypeOf<IsParamsOptional<'/x/:a?'>>().toEqualTypeOf<true>()
+    expectTypeOf<IsParamsOptional<'/x&token!'>>().toEqualTypeOf<false>() // a required search param binds get() too
+  })
+
+  it('ParamsInputStringOnly and GetPathInputByRoute cover tails', () => {
+    expectTypeOf<ParamsInputStringOnly<'/v:maj[int].:min[int]?'>>().toEqualTypeOf<{
+      maj: string
+      min?: string | undefined
+    }>()
+    const route = Route0.create('/my/:slug.:ext(md|txt)')
+    expect(route.definition).toBe('/my/:slug.:ext(md|txt)')
+    type Input = GetPathInputByRoute<typeof route>
+    expectTypeOf<Input['slug']>().toEqualTypeOf<string | number>()
+    expectTypeOf<Input['ext']>().toEqualTypeOf<'md' | 'txt'>()
+  })
+
+  it('search output types carry typed declarations', () => {
+    const route = Route0.create('/e&from[date]&flags[bool][]&mode(a|b)=a')
+    expect(route.definition).toBe('/e&from[date]&flags[bool][]&mode(a|b)=a')
+    expectTypeOf<typeof route.Infer.SearchOutput>().toEqualTypeOf<{
+      from: Date | undefined
+      flags: boolean[]
+      mode: 'a' | 'b'
+    }>()
+  })
+
+  it('a full-fat definition infers end to end', () => {
+    const route = Route0.create('/:locale(ru|en)?/f/img-:id[int].:ext(png|jpg)&w[int]&full[bool]=false&')
+    expect(route.get({ id: 7, ext: 'png', '?': { w: 100, extra: 1 } })).toBe('/f/img-7.png?w=100&extra=1')
+    expect(route.get({ locale: 'ru', id: 7, ext: 'jpg' })).toBe('/ru/f/img-7.jpg')
+    expectTypeOf<typeof route.Infer.ParamsOutput>().toEqualTypeOf<{
+      locale: 'ru' | 'en' | undefined
+      id: number
+      ext: 'png' | 'jpg'
+    }>()
+    type SearchOutput = typeof route.Infer.SearchOutput
+    expectTypeOf<SearchOutput['w']>().toEqualTypeOf<number | undefined>()
+    expectTypeOf<SearchOutput['full']>().toEqualTypeOf<boolean>()
+    expectTypeOf<SearchOutput['anything_else']>().toEqualTypeOf<unknown>() // loose: extras allowed, unknown-typed
+    const location = Routes.create({ img: route })._.getLocation('/f/img-7.png?w=5&full=true')
+    expect(location.route).toBe('/:locale(ru|en)?/f/img-:id[int].:ext(png|jpg)&w[int]&full[bool]=false&')
+    expect(location.params).toEqual({ locale: undefined, id: 7, ext: 'png' })
+    expect(location.search as Record<string, unknown>).toEqual({ w: 5, full: true })
+  })
+})
+
+describe('phase-4 advisor fixes', () => {
+  it('a literal "*" in any value stays a literal — no placeholder re-substitution', () => {
+    expect(Route0.create('/docs/*.md').get({ '*': 'a*b' })).toBe('/docs/a*b.md')
+    expect(Route0.create('/raw/*.:ext').get({ '*': 'a*b', ext: 'md' })).toBe('/raw/a*b.md')
+    expect(Route0.create('/raw/*').get({ '*': 'a*b' })).toBe('/raw/a*b')
+    expect(Route0.create('/app*').get({ '*': 'x*y' })).toBe('/appx*y')
+    // params percent-encode nothing for '*', but the segment is emitted token-wise — nothing rescans it
+    expect(Route0.create('/u/:name').get({ name: 'a*b' })).toBe('/u/a*b')
+    expect(Route0.create('/u/:name').getRelation('/u/a*b').params).toEqual({ name: 'a*b' })
+  })
+
+  it('disjoint wildcard suffixes and tails coexist instead of falsely conflicting', () => {
+    expect(Route0.create('/docs/*.md').isOverlap('/docs/*.js')).toBe(false)
+    expect(Route0.create('/docs/*.md').isConflict('/docs/*.js')).toBe(false)
+    expect(Route0.create('/r/*.:e(md)').isOverlap('/r/*.:f(png)')).toBe(false)
+    expect(Route0.create('/r/*.:e(md)').isConflict('/r/*.:f(png)')).toBe(false)
+    // nesting suffixes still overlap, identical structures still conflict
+    expect(Route0.create('/docs/*.tar.gz').isOverlap('/docs/*.gz')).toBe(true)
+    expect(Route0.create('/docs/*.md').isConflict('/docs/*.md')).toBe(true)
+    expect(Route0.create('/r/*.:a').isConflict('/r/*.:b')).toBe(true) // same language, only names differ
+    const routes = Routes.create({ md: '/docs/*.md', js: '/docs/*.js' })
+    expect(routes._.getLocation('/docs/a/b.md').route).toBe('/docs/*.md')
+    expect(routes._.getLocation('/docs/a/b.js').route).toBe('/docs/*.js')
+  })
+
+  it('tail constraints drive ordering: the narrowest tail wins the URL', () => {
+    const routes = Routes.create({
+      plain: '/x/:a.:b',
+      enumt: '/x/:file.:ext(md|txt)',
+      inty: '/x/:f.:v[int]',
+    })
+    expect(routes._.pathsOrdering).toEqual(['/x/:file.:ext(md|txt)', '/x/:f.:v[int]', '/x/:a.:b'])
+    expect(routes._.getLocation('/x/doc.md').route).toBe('/x/:file.:ext(md|txt)')
+    expect(routes._.getLocation('/x/t.5').route).toBe('/x/:f.:v[int]')
+    expect(routes._.getLocation('/x/t.other').route).toBe('/x/:a.:b')
+    // wildcard tails rank the same way
+    const wild = Routes.create({ plain: '/w/*.:a', typed: '/w/*.:n[int]' })
+    expect(wild._.pathsOrdering).toEqual(['/w/*.:n[int]', '/w/*.:a'])
+    expect(wild._.getLocation('/w/f.5').route).toBe('/w/*.:n[int]')
+    expect(wild._.getLocation('/w/f.x').route).toBe('/w/*.:a')
+  })
+
+  it('tail constraints refine conflicts: subsets resolve, crossings conflict, disjoints coexist', () => {
+    expect(Route0.create('/x/:a.:b').isConflict('/x/:file.:ext(md|txt)')).toBe(false) // enum tail is narrower
+    expect(Route0.create('/x/:a.:b').isConflict('/x/:f.:v[int]')).toBe(false) // typed tail is narrower
+    expect(Route0.create('/x/:a.:b[int]').isOverlap('/x/:c.:d[uuid]')).toBe(false) // disjoint tail languages
+    expect(Route0.create('/x/:a.:b[int]').isConflict('/x/:c.:d[uuid]')).toBe(false)
+    expect(Route0.create('/x/:a.:b[int]').isConflict('/x/:c.:d[bigint]')).toBe(true) // same tail language
+    expect(Route0.create('/x/:a.:b(md|txt)').isConflict('/x/:c.:d(txt|pdf)')).toBe(true) // crossing value sets
+    expect(Route0.create('/x/:a.:b(md|txt)').isOverlap('/x/:c.:d(png|jpg)')).toBe(false) // disjoint value sets
+  })
+})
+
+describe('Infer.SearchInputStringOnly', () => {
+  it('serializes declared search params to their URL-string forms', () => {
+    const route = Route0.create('/search&q&page[int]=0&sort(new|top)&ids[int][]&token!')
+    expect(route.definition).toBe('/search&q&page[int]=0&sort(new|top)&ids[int][]&token!')
+    expectTypeOf<typeof route.Infer.SearchInputStringOnly>().toEqualTypeOf<{
+      token: string
+      q?: string | undefined
+      page?: string | undefined
+      sort?: 'new' | 'top' | undefined
+      ids?: string[] | undefined
+    }>()
+  })
+
+  it('keeps loose and undeclared routes open', () => {
+    const loose = Route0.create('/x&page[int]&')
+    expect(loose.searchLoose).toBe(true)
+    type Loose = typeof loose.Infer.SearchInputStringOnly
+    expectTypeOf<Loose['page']>().toEqualTypeOf<string | undefined>()
+    expectTypeOf<Loose['whatever']>().toEqualTypeOf<unknown>()
+    const anything = Route0.create('/x')
+    expect(anything.searchLoose).toBe(true)
+    expectTypeOf<typeof anything.Infer.SearchInputStringOnly>().toEqualTypeOf<UnknownSearchInput>()
+  })
+})
+
+describe('the never-throw policy of get()', () => {
+  // Building a link must never take a page down: a value that slipped past the types (a form, a DB, JSON) yields a
+  // broken href at worst. The schema is the loud counterpart for when validation is wanted.
+  it('survives hostile values across every param kind', () => {
+    const zoo = Routes.create({
+      plain: '/p/:name',
+      en: '/e/:kind(a|b)',
+      typed: '/t/:id[int]/:flag[bool]?/:d[date]?',
+      affixed: '/a/img-:id[int].png',
+      tailed: '/x/:slug.:ext(md|txt)?',
+      wild: '/w/*.md',
+      search: '/s&page[int]=0&tags[]&token!',
+    })
+    const hostile = [undefined, null, '', 'zxc', 0, -1.5, NaN, Infinity, true, {}, [], new Date('garbage'), '\uD800']
+    for (const value of hostile) {
+      for (const route of zoo._.ordered) {
+        const input: Record<string, unknown> = { '?': { page: value, tags: value, extra: value } }
+        for (const key of route.getParamsKeys()) input[key] = value
+        expect(() => (route as unknown as (i: unknown) => string)(input)).not.toThrow()
+        expect(typeof (route as unknown as (i: unknown) => string)(input)).toBe('string')
+      }
+    }
+  })
+
+  it('a lone surrogate survives encoding', () => {
+    expect(Route0.create('/u/:name').get({ name: '\uD800' })).toBe('/u/\uD800')
+  })
+
+  it('a circular search object drops the search string instead of throwing', () => {
+    const circular: Record<string, unknown> = {}
+    circular.self = circular
+    expect(() => Route0.create('/x').get({ '?': circular })).not.toThrow()
+  })
+
+  it('an unset or malformed origin falls back to a relative URL — no exceptions to the policy', () => {
+    const route = Route0.create('/x/:id', { origin: '' })
+    expect(route.get({ id: 1 })).toBe('/x/1')
+    expect(route.abs({ id: 1 })).toBe('/x/1') // no origin configured — stays relative
+    expect(route.get({ id: 1 }, { origin: 'not a url' })).toBe('/x/1') // malformed origin — stays relative
+    const configured = Route0.create('/x/:id', { origin: 'https://x.dev' })
+    expect(configured.abs({ id: 1 })).toBe('https://x.dev/x/1')
+  })
+
+  it('hostile input objects degrade to "no input"', () => {
+    const route = Route0.create('/u/:name')
+    const throwingGetter = Object.defineProperty({}, 'name', {
+      enumerable: true,
+      get() {
+        throw new Error('boom')
+      },
+    })
+    expect(route.get(throwingGetter as { name: string })).toBe('/u/undefined')
+    const revoked = Proxy.revocable({}, {})
+    revoked.revoke()
+    expect(route.get(revoked.proxy as { name: string })).toBe('/u/undefined')
+  })
+
+  it('both schemas reject a rolled-over date string instead of coercing it silently', () => {
+    // '2026-02-29' is the one calendar hole the month-aware regex leaves; some engines roll it to March 1
+    expect(Route0.create('/d/:d[date]').schema.safeParse({ d: '2026-02-29' }).success).toBe(false)
+    expect(Route0.create('/d/:d[date]').schema.safeParse({ d: '2028-02-29' }).success).toBe(true) // a real leap day
+    const search = Route0.create('/e&from[date]')
+    expect(search.searchSchema.safeParse({ from: '2026-02-29' }).success).toBe(false)
+    expect((search.searchSchema.parse({ from: '2028-02-29' }).from as Date).getTime()).toBe(Date.UTC(2028, 1, 29))
+    expect(search.coerceSearch({ from: '2026-02-29' })).toEqual({ from: undefined }) // lenient view: degrades
+  })
+
+  it('searchSchema.safeParse survives a hostile enum value', () => {
+    const route = Route0.create('/x&k(a|b)')
+    const hostile = {
+      toString() {
+        throw new Error('boom')
+      },
+    }
+    const result = route.searchSchema.safeParse({ k: hostile })
+    expect(result.success).toBe(false)
+  })
+})
+
+describe('never-throw: hostile toString', () => {
+  it('an object whose toString throws still builds a URL', () => {
+    const hostile = {
+      toString() {
+        throw new Error('boom')
+      },
+    }
+    expect(Route0.create('/u/:name').get({ name: hostile as unknown as string })).toBe('/u/undefined')
+    expect(Route0.create('/n/:id[int]').get({ id: hostile as unknown as number })).toBe('/n/undefined')
+    expect(Route0.create('/f/*').get({ '*': hostile as unknown as string })).toBe('/f/')
+    expect(Route0.create('/e/:k(a|b)').get({ k: hostile as unknown as 'a' })).toBe('/e/undefined')
   })
 })

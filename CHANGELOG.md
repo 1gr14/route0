@@ -5,6 +5,53 @@ work; `bun run release` promotes that section to the new version.
 
 ## Unreleased
 
+- Feature: typed params — `:id[int]`, plus `[bool]`, `[num]`, `[bigint]`,
+  `[uuid]`, `[date]`, `[datetime]` and the negative `[-int]`/`[-num]`/
+  `[-bigint]`. A typed param matches only the type's canonical string form (no
+  leading zeros, no `+`, no exponents, never `-0`), parses to the real JS value
+  (`number`, `boolean`, `bigint`, `Date`), and `get()` accepts the typed value
+  or its canonical string. `.schema` validates the typed values and the emitted
+  JSON Schema carries the right shapes (`integer` + `minimum`, `boolean`,
+  `format: 'uuid'`/`'date'`/`'date-time'`). Types feed specificity and the
+  overlap/conflict analysis.
+- Feature: search params declared in the pattern — `&`-separated after the
+  path: `/ideas&q&page[int]=0&sort(new|top)=new&ids[int][]&token!`. Each
+  declaration is a name plus optional `[type]` or `(enum)`, `[]` for an array,
+  `!` for required, `=default` (parse-side only — building never inserts it).
+  Declarations close `get()`'s `?` object to those keys; a trailing `&` keeps
+  it open (loose). New surface: `route.searchParams` (descriptor map),
+  `route.searchSchema` (Standard Schema + JSON Schema — coerces declared keys,
+  fills defaults, wraps arrays, drops unknowns in strict mode),
+  `route.coerceSearch()` (same conversion, an invalid value degrades to its
+  absent case). A collection applies `coerceSearch` on an exact match, so
+  `getLocation(...).search` arrives typed. `extend()` concatenates declarations
+  from both sides; `.search<T>()` stays as the type-only escape hatch and now
+  merges on top of the declared keys.
+- Feature: a param can share its segment with literal text — prefix and/or
+  suffix: `/files/img-:id[int].png`, `/v:major[int]`, `/:file.mp4`. A trailing
+  `?` makes the whole segment optional, prefix and suffix dropping out with the
+  value. Any `:` in a non-wildcard segment is param intent: what doesn't parse
+  is rejected at creation, never silently downgraded to a static segment.
+- Feature: a second (tail) param after a one-character delimiter (`.`, `-`,
+  `~`): `/my/:slug.:ext`, `/v:maj[int].:min[int]`, `/range/:from-:to`. The
+  split lands on the last delimiter (a tail never contains its own), `?` makes
+  the tail optional with a bijection guard in `.schema`, and the same mechanics
+  work on wildcards: `/docs/*.md`, `/raw/*.:ext`.
+- Breaking: building never throws. `get()`/`abs()` are best-effort — a value
+  that slipped past the types builds a link that at worst matches nothing, a
+  missing required param emits the literal `undefined`, an unset or malformed
+  `origin` keeps the URL relative (it used to throw). Loud validation is
+  `.schema` / `.searchSchema`.
+- Breaking: an exact location's `search` is typed by the route's declarations
+  (declared keys coerced; without declarations the raw parse, as before), so
+  `ExactLocation` carries a `search` that can hold non-string values. New
+  `AnySearchParsed`/`AnySearchParsedValue` is the widest search shape and what a
+  generic `ExactLocation<T>` falls back to — `AnyLocation` stays the top of the
+  location family.
+- Types: `Infer` gains `SearchInput`, `SearchInputStringOnly`, `SearchOutput`;
+  all three also exist standalone (taking a route or a definition string), plus
+  `HasSearchDecls`, `SearchParamDefinition`, `RouteTokenTail`, `ParamTypeName`.
+
 ## 0.3.0 — 2026-07-20
 
 - Breaking: `route.params` maps a param name to a descriptor —
