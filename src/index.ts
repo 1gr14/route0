@@ -1598,6 +1598,86 @@ export class Route0<TDefinition extends string, TSearchInput extends UnknownSear
     return Route0.create(this.definition, config) as CallableRoute<TDefinition>
   }
 
+  /** Whether the path captures a wildcard — the runtime mirror of the `HasWildcard<T>` type. */
+  get hasWildcard(): boolean {
+    return this.routeTokens.some((token) => token.kind === 'wildcard')
+  }
+
+  /**
+   * The route's path as a URI-Template-style string — `{param}` in place of every param, in-segment literals kept:
+   * `/posts/:kind(new|top)/:id` ⇒ `/posts/{kind}/{id}`, `/files/img-:id[int].png` ⇒ `/files/img-{id}.png`,
+   * `/my/:slug.:ext` ⇒ `/my/{slug}.{ext}`. This is the form OpenAPI's `paths` object speaks — pair it with
+   * {@link toOpenapiParameters}. Search declarations never appear: they are query params, not path.
+   *
+   * What a template cannot express is dropped, never invented: a value constraint, a param type and a trailing `?` stay
+   * out (an optional param emits like a required one — a template has no optional segments), and a wildcard has no
+   * template equivalent, so it is emitted verbatim (`/docs/*`; suffix and tail kept: `/raw/*.{ext}`).
+   */
+  toUriTemplate(): string {
+    const tokens = this.routeTokens
+    if (tokens.length === 0) {
+      return '/'
+    }
+    const tailPart = (tail: RouteTokenTail | undefined): string => (tail ? `${tail.delimiter}{${tail.name}}` : '')
+    return tokens
+      .map((token) => {
+        if (token.kind === 'param') {
+          return `/${token.prefix ?? ''}{${token.name}}${token.suffix ?? ''}${tailPart(token.tail)}`
+        }
+        if (token.kind === 'wildcard') {
+          return `/${token.prefix}*${token.optional ? '?' : ''}${token.suffix ?? ''}${tailPart(token.tail)}`
+        }
+        return `/${token.value}`
+      })
+      .join('')
+  }
+
+  /**
+   * The route as OpenAPI `parameters`: every path param (`in: 'path'`, always `required: true` — the OpenAPI spec
+   * demands it, an optional param included) followed by every declared search param (`in: 'query'`, `required` from
+   * `!`). Schemas are the canonical typed shapes — `[int]` ⇒ `{ type: 'integer', minimum: 0 }`, an enum ⇒ its `enum`, a
+   * plain param ⇒ `{ type: 'string' }`; an array declaration wraps in `{ type: 'array' }`, a default lands as `default`
+   * (in its URL-string form when the typed value is not JSON — a `Date`, a `bigint`). The wildcard is skipped:
+   * {@link toUriTemplate} emits it verbatim, so no template variable refers to it.
+   */
+  toOpenapiParameters(): Array<{
+    name: string
+    in: 'path' | 'query'
+    required: boolean
+    schema: Record<string, unknown>
+  }> {
+    const pathParameters = Object.entries(this.paramsDefinition)
+      .filter(([name]) => name !== '*')
+      .map(([name, def]) => ({
+        name,
+        in: 'path' as const,
+        required: true,
+        schema:
+          def.type === 'enum'
+            ? { type: 'string', enum: [...def.values] }
+            : def.type !== 'string'
+              ? { ...PARAM_TYPES[def.type].jsonSchemaOutput }
+              : { type: 'string' },
+      }))
+    const queryParameters = Object.entries(this.searchParams).map(([name, def]) => {
+      const scalar = this._searchScalarJSONSchema(def, 'output')
+      const schema: Record<string, unknown> = def.array ? { type: 'array', items: scalar } : scalar
+      if ('default' in def && def.default !== undefined) {
+        const jsonDefault =
+          def.default instanceof Date
+            ? def.type === 'date'
+              ? def.default.toISOString().slice(0, 10)
+              : def.default.toISOString()
+            : typeof def.default === 'bigint'
+              ? def.default.toString()
+              : def.default
+        return { name, in: 'query' as const, required: def.required, schema: { ...schema, default: jsonDefault } }
+      }
+      return { name, in: 'query' as const, required: def.required, schema }
+    })
+    return [...pathParameters, ...queryParameters]
+  }
+
   get regexBaseString(): string {
     if (this._regexBaseString === undefined) {
       if (this.definition === '/') {

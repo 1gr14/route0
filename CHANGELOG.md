@@ -5,6 +5,17 @@ work; `bun run release` promotes that section to the new version.
 
 ## Unreleased
 
+- Feature: OpenAPI helpers. `toUriTemplate()` emits the path in the `{param}`
+  URI-template form OpenAPI's `paths` object speaks — in-segment literals and
+  tail params included; a value constraint, a param type or a trailing `?`
+  never leak in; a wildcard, having no template variable, is emitted verbatim.
+  `toOpenapiParameters()` emits the matching `parameters` array: path params
+  always `required: true` (the spec demands it; the wildcard is skipped),
+  declared search params as `in: 'query'` with the canonical typed schemas,
+  arrays wrapped, defaults attached (a `Date`/`bigint` default in its
+  URL-string form).
+- Feature: `hasWildcard` — the runtime mirror of the `HasWildcard<T>` type.
+
 ## 0.4.0 — 2026-08-26
 
 - Feature: typed params — `:id[int]`, plus `[bool]`, `[num]`, `[bigint]`,

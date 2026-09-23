@@ -523,6 +523,36 @@ route.schema.safeParse({ slug: 'x' })
 route.schema.parse({ id: '1' }) // { id: '1', slug: undefined } — throws on invalid input
 ```
 
+## OpenAPI
+
+A route describes an OpenAPI operation completely, and two helpers hand it over.
+`toUriTemplate()` is the path in the `{param}` template form OpenAPI's `paths`
+object speaks — in-segment literals and tail params included, while a value
+constraint, a param type or a trailing `?` never leak in.
+`toOpenapiParameters()` is the matching `parameters` array: every path param
+(always `required: true` — the spec demands it), then every declared search
+param as `in: 'query'` with the canonical typed schema, arrays wrapped and
+defaults attached:
+
+```ts
+const route = Route0.create('/files/img-:id[int].png&page[int]=0&token!')
+
+route.toUriTemplate() // '/files/img-{id}.png'
+route.toOpenapiParameters()
+// [
+//   { name: 'id', in: 'path', required: true, schema: { type: 'integer', minimum: 0 } },
+//   { name: 'page', in: 'query', required: false, schema: { type: 'integer', minimum: 0, default: 0 } },
+//   { name: 'token', in: 'query', required: true, schema: { type: 'string' } },
+// ]
+```
+
+A wildcard has no template variable, so `toUriTemplate()` emits it verbatim
+(`/docs/*`, `/raw/*.{ext}`) and `toOpenapiParameters()` skips it. For request
+and response **bodies** keep using `.schema` / `.searchSchema` — both implement
+Standard JSON Schema, so
+`schema['~standard'].jsonSchema.input({ target: 'openapi-3.0' })` emits the
+object form directly.
+
 ## Infer types from a route
 
 Every route carries a type-only `Infer` field, so you can pull its types

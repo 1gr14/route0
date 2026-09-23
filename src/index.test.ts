@@ -1804,6 +1804,52 @@ describe('params schema', () => {
   })
 })
 
+describe('toUriTemplate / toOpenapiParameters / hasWildcard', () => {
+  it('emits the URI-template form of the path — params braced, in-segment literals and tails kept', () => {
+    expect(Route0.create('/').toUriTemplate()).toBe('/')
+    expect(Route0.create('/posts/:kind(new|top)/:id').toUriTemplate()).toBe('/posts/{kind}/{id}')
+    expect(Route0.create('/users/:id[int]').toUriTemplate()).toBe('/users/{id}')
+    expect(Route0.create('/users/:id?').toUriTemplate()).toBe('/users/{id}')
+    expect(Route0.create('/files/img-:id[int].png').toUriTemplate()).toBe('/files/img-{id}.png')
+    expect(Route0.create('/my/:slug.:ext').toUriTemplate()).toBe('/my/{slug}.{ext}')
+    expect(Route0.create('/v:maj[int].:min[int]').toUriTemplate()).toBe('/v{maj}.{min}')
+    // a wildcard has no template equivalent — verbatim, its suffix and tail still templated where possible
+    expect(Route0.create('/docs/*').toUriTemplate()).toBe('/docs/*')
+    expect(Route0.create('/docs/*.md').toUriTemplate()).toBe('/docs/*.md')
+    expect(Route0.create('/raw/*.:ext').toUriTemplate()).toBe('/raw/*.{ext}')
+    // search declarations are query params — never part of the path template
+    expect(Route0.create('/ideas/:id[int]&q&page[int]=0').toUriTemplate()).toBe('/ideas/{id}')
+  })
+
+  it('emits OpenAPI parameters — path params always required, declared search as query', () => {
+    const route = Route0.create(
+      '/posts/:kind(new|top)/:id[int]/:slug?&q&page[int]=0&sort(new|top)=new&ids[int][]&token!',
+    )
+    expect(route.toOpenapiParameters()).toEqual([
+      { name: 'kind', in: 'path', required: true, schema: { type: 'string', enum: ['new', 'top'] } },
+      { name: 'id', in: 'path', required: true, schema: { type: 'integer', minimum: 0 } },
+      // OpenAPI has no optional path params — an optional one is emitted required, like in the template
+      { name: 'slug', in: 'path', required: true, schema: { type: 'string' } },
+      { name: 'q', in: 'query', required: false, schema: { type: 'string' } },
+      { name: 'page', in: 'query', required: false, schema: { type: 'integer', minimum: 0, default: 0 } },
+      { name: 'sort', in: 'query', required: false, schema: { type: 'string', enum: ['new', 'top'], default: 'new' } },
+      { name: 'ids', in: 'query', required: false, schema: { type: 'array', items: { type: 'integer', minimum: 0 } } },
+      { name: 'token', in: 'query', required: true, schema: { type: 'string' } },
+    ])
+    // the wildcard is skipped — the template carries it verbatim, no variable refers to it; the tail param stays
+    expect(Route0.create('/raw/*.:ext').toOpenapiParameters()).toEqual([
+      { name: 'ext', in: 'path', required: true, schema: { type: 'string' } },
+    ])
+  })
+
+  it('hasWildcard mirrors the HasWildcard type at runtime', () => {
+    expect(Route0.create('/docs/*').hasWildcard).toBe(true)
+    expect(Route0.create('/raw/*.:ext').hasWildcard).toBe(true)
+    expect(Route0.create('/docs/:id').hasWildcard).toBe(false)
+    expect(Route0.create('/').hasWildcard).toBe(false)
+  })
+})
+
 describe('Routes', () => {
   it('create with string routes', () => {
     const collection = Routes.create({
