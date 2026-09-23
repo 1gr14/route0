@@ -5,6 +5,8 @@ work; `bun run release` promotes that section to the new version.
 
 ## Unreleased
 
+## 0.4.1 — 2026-09-23
+
 - Feature: OpenAPI helpers. `toUriTemplate()` emits the path in the `{param}`
   URI-template form OpenAPI's `paths` object speaks — in-segment literals and
   tail params included; a value constraint, a param type or a trailing `?`
